@@ -1,0 +1,22 @@
+[package]
+name    = "iv-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "imageviewer"
+path = "src/main.rs"
+
+[dependencies]
+iv-core     = { path = "../iv-core" }
+iv-formats  = { path = "../iv-formats" }
+iv-renderer = { path = "../iv-renderer" }
+winit       = { workspace = true }
+egui        = { workspace = true }
+egui-wgpu   = { workspace = true }
+egui-winit  = { workspace = true }
+anyhow      = { workspace = true }
+log         = { workspace = true }
+env_logger  = { workspace = true }
+clap        = { workspace = true }

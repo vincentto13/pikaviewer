@@ -1,0 +1,10 @@
+[package]
+name    = "iv-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iv-core = { path = "../iv-core" }
+image   = { workspace = true }
+log     = { workspace = true }

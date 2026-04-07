@@ -1,0 +1,420 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+use winit::window::Window;
+
+use iv_core::format::DecodedImage;
+
+use crate::display_mode::{compute_layout, DisplayMode, QuadNdc};
+
+// ── Vertex layout ─────────────────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct Vertex {
+    position: [f32; 2],
+    uv:       [f32; 2],
+}
+
+impl Vertex {
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+        step_mode:    wgpu::VertexStepMode::Vertex,
+        attributes:   &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+    };
+}
+
+/// Build 4 vertices (TL, TR, BL, BR) for a TriangleStrip quad.
+///
+/// `rotation` is in 90° CW steps (0 = normal, 1 = 90°CW, 2 = 180°, 3 = 270°CW).
+/// UVs are remapped so the correct corner of the source texture lands at each
+/// screen corner, producing the visual rotation effect without changing the shader.
+///
+/// UV derivation (TL, TR, BL, BR of on-screen quad → source UV):
+///   0°:   (0,0) (1,0) (0,1) (1,1)  — identity
+///   90°CW:(0,1) (0,0) (1,1) (1,0)  — original BL→screen-TL
+///   180°: (1,1) (0,1) (1,0) (0,0)
+///   270°CW(1,0) (1,1) (0,0) (0,1)  — original TR→screen-TL
+fn quad_vertices(q: QuadNdc, rotation: u32) -> [Vertex; 4] {
+    let uvs: [[f32; 2]; 4] = match rotation % 4 {
+        0 => [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        1 => [[0.0, 1.0], [0.0, 0.0], [1.0, 1.0], [1.0, 0.0]],
+        2 => [[1.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        3 => [[1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 1.0]],
+        _ => unreachable!(),
+    };
+    [
+        Vertex { position: [q.left,  q.top],    uv: uvs[0] },
+        Vertex { position: [q.right, q.top],    uv: uvs[1] },
+        Vertex { position: [q.left,  q.bottom], uv: uvs[2] },
+        Vertex { position: [q.right, q.bottom], uv: uvs[3] },
+    ]
+}
+
+// ── Renderer ──────────────────────────────────────────────────────────────────
+
+pub struct Renderer {
+    surface:           wgpu::Surface<'static>,
+    device:            wgpu::Device,
+    queue:             wgpu::Queue,
+    config:            wgpu::SurfaceConfiguration,
+    pipeline:          wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    egui_renderer:     egui_wgpu::Renderer,
+
+    image_state: Option<ImageState>,
+
+    pub display_mode: DisplayMode,
+    pub image_size:   Option<(u32, u32)>,
+    /// 0 = 0°, 1 = 90°CW, 2 = 180°, 3 = 270°CW
+    pub rotation:     u32,
+    screen_size:      (u32, u32),
+}
+
+struct ImageState {
+    bind_group: wgpu::BindGroup,
+    vertex_buf: wgpu::Buffer,
+}
+
+impl Renderer {
+    pub fn new(window: Arc<Window>) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let surface = instance.create_surface(window.clone())
+            .context("create surface")?;
+
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference:       wgpu::PowerPreference::default(),
+                compatible_surface:     Some(&surface),
+                force_fallback_adapter: false,
+            },
+        ))
+        .context("no suitable GPU adapter")?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label:             None,
+                required_features: wgpu::Features::empty(),
+                required_limits:   wgpu::Limits::default(),
+                memory_hints:      wgpu::MemoryHints::default(),
+            },
+            None,
+        ))
+        .context("request device")?;
+
+        let size   = window.inner_size();
+        let caps   = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter().copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width:                         size.width.max(1),
+            height:                        size.height.max(1),
+            present_mode:                  wgpu::PresentMode::AutoVsync,
+            alpha_mode:                    caps.alpha_modes[0],
+            view_formats:                  vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        // ── Image bind group layout ───────────────────────────────────────────
+
+        let bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label:   Some("image_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(
+                            wgpu::SamplerBindingType::Filtering,
+                        ),
+                        count: None,
+                    },
+                ],
+            },
+        );
+
+        // ── Image render pipeline ─────────────────────────────────────────────
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("image_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/image.wgsl").into(),
+            ),
+        });
+
+        let pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label:                Some("image_layout"),
+                bind_group_layouts:   &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label:  Some("image_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module:              &shader,
+                    entry_point:         "vs_main",
+                    buffers:             &[Vertex::LAYOUT],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module:              &shader,
+                    entry_point:         "fs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend:      Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample:   wgpu::MultisampleState::default(),
+                multiview:     None,
+                cache:         None,
+            });
+
+        // ── egui renderer ─────────────────────────────────────────────────────
+
+        // 5th arg = dithering (added in wgpu 22 / egui-wgpu 0.29)
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+
+        let screen_size = window
+            .current_monitor()
+            .map(|m| { let s = m.size(); (s.width, s.height) })
+            .unwrap_or((1920, 1080));
+
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            pipeline,
+            bind_group_layout,
+            egui_renderer,
+            image_state:  None,
+            display_mode: DisplayMode::Regular,
+            image_size:   None,
+            rotation:     0,
+            screen_size,
+        })
+    }
+
+    // ── Public controls ───────────────────────────────────────────────────────
+
+    pub fn set_image(&mut self, image: &DecodedImage) {
+        self.image_size = Some((image.width, image.height));
+
+        let texture = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label:            Some("image_texture"),
+                size:             wgpu::Extent3d {
+                    width: image.width, height: image.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count:  1,
+                sample_count:     1,
+                dimension:        wgpu::TextureDimension::D2,
+                format:           wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage:            wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                view_formats:     &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &image.pixels,
+        );
+
+        let view    = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label:           Some("image_sampler"),
+            address_mode_u:  wgpu::AddressMode::ClampToEdge,
+            address_mode_v:  wgpu::AddressMode::ClampToEdge,
+            mag_filter:      wgpu::FilterMode::Linear,
+            min_filter:      wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("image_bg"),
+            layout:  &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let vertex_buf = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label:    Some("vertex_buf"),
+                contents: bytemuck::cast_slice(&quad_vertices(self.current_quad(), self.rotation)),
+                usage:    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+
+        self.image_state = Some(ImageState { bind_group, vertex_buf });
+    }
+
+    /// Rotate by one 90° step. `clockwise = true` → +90°CW.
+    pub fn rotate(&mut self, clockwise: bool) {
+        self.rotation = if clockwise {
+            (self.rotation + 1) % 4
+        } else {
+            (self.rotation + 3) % 4
+        };
+        self.refresh_vertex_buf();
+    }
+
+    pub fn resize(&mut self, new_w: u32, new_h: u32) {
+        if new_w == 0 || new_h == 0 { return; }
+        self.config.width  = new_w;
+        self.config.height = new_h;
+        self.surface.configure(&self.device, &self.config);
+        self.refresh_vertex_buf();
+    }
+
+    /// Returns the window size to request for the current image + mode (Regular
+    /// mode only). `None` means don't resize.
+    pub fn compute_window_size(&self) -> Option<(u32, u32)> {
+        let img = self.effective_image_size()?;
+        compute_layout(
+            self.display_mode,
+            img,
+            (self.config.width, self.config.height),
+            self.screen_size,
+        )
+        .request_size
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────────────────
+
+    pub fn render(
+        &mut self,
+        paint_jobs:    &[egui::ClippedPrimitive],
+        tex_delta:     &egui::TexturesDelta,
+        screen_desc:   &egui_wgpu::ScreenDescriptor,
+    ) -> Result<()> {
+        let output = match self.surface.get_current_texture() {
+            Ok(t)                           => t,
+            Err(wgpu::SurfaceError::Outdated) => return Ok(()),
+            Err(e)                          => return Err(e.into()),
+        };
+
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Upload egui texture changes
+        for (id, delta) in &tex_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &tex_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("render_encoder") },
+        );
+
+        // Upload egui vertex/index buffers into the encoder
+        self.egui_renderer.update_buffers(
+            &self.device, &self.queue, &mut encoder, paint_jobs, screen_desc,
+        );
+
+        {
+            // forget_lifetime() converts RenderPass<'encoder> → RenderPass<'static>,
+            // which is required by egui-wgpu 0.29 / wgpu 22.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view:           &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            })
+            .forget_lifetime();
+
+            // 1. image quad
+            if let Some(state) = &self.image_state {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &state.bind_group, &[]);
+                pass.set_vertex_buffer(0, state.vertex_buf.slice(..));
+                pass.draw(0..4, 0..1);
+            }
+
+            // 2. egui overlay on top
+            self.egui_renderer.render(&mut pass, paint_jobs, screen_desc);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Image dimensions accounting for 90°/270° rotation (swaps w↔h).
+    fn effective_image_size(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.image_size?;
+        if self.rotation % 2 == 1 { Some((h, w)) } else { Some((w, h)) }
+    }
+
+    fn current_quad(&self) -> QuadNdc {
+        match self.effective_image_size() {
+            None      => QuadNdc::full_screen(),
+            Some(img) => compute_layout(
+                self.display_mode,
+                img,
+                (self.config.width, self.config.height),
+                self.screen_size,
+            ).quad,
+        }
+    }
+
+    fn refresh_vertex_buf(&mut self) {
+        let quad     = self.current_quad();
+        let rotation = self.rotation;
+        if let Some(state) = &self.image_state {
+            self.queue.write_buffer(
+                &state.vertex_buf,
+                0,
+                bytemuck::cast_slice(&quad_vertices(quad, rotation)),
+            );
+        }
+    }
+}
