@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="PikaViewer" width="200">
+</p>
+
 # PikaViewer
 
 A fast, lightweight, GPU-accelerated image viewer built with Rust.
