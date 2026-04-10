@@ -1,4 +1,6 @@
 target/
+dist/
 *.swp
 *.swo
 .DS_Store
+assets/icon.icns

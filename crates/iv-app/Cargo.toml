@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "imageviewer"
+name = "pikaviewer"
 path = "src/main.rs"
+
+[features]
+heic = ["dep:iv-format-heic", "iv-format-heic/libheif-rs"]
 
 [dependencies]
 iv-core     = { path = "../iv-core" }
+iv-format-heic = { path = "../iv-format-heic", optional = true }
 iv-formats  = { path = "../iv-formats" }
 iv-renderer = { path = "../iv-renderer" }
 winit       = { workspace = true }
@@ -20,3 +24,8 @@ anyhow      = { workspace = true }
 log         = { workspace = true }
 env_logger  = { workspace = true }
 clap        = { workspace = true }
+serde       = { workspace = true }
+toml        = { workspace = true }
+dirs        = { workspace = true }
+wgpu        = { workspace = true }
+kamadak-exif = { workspace = true }

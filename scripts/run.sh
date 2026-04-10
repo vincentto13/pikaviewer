@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run the imageviewer Docker container with X11 forwarding.
+# Run the pikaviewer Docker container with X11 forwarding.
 # Usage: ./scripts/run.sh [image-or-directory]
 set -euo pipefail
 
-IMAGE_TAG="imageviewer-builder:latest"
+IMAGE_TAG="pikaviewer-builder:latest"
 IMAGES_PATH="${1:-}"
 
 if [[ -z "$IMAGES_PATH" ]]; then

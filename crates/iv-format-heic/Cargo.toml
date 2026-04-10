@@ -1,0 +1,15 @@
+[package]
+name    = "iv-format-heic"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+# "libheif-rs" is the sub-feature that actually links against the C library.
+# iv-app/heic enables both this crate (as an optional dep) AND this feature,
+# ensuring libheif-sys is only linked when explicitly requested.
+libheif-rs = ["dep:libheif-rs"]
+
+[dependencies]
+iv-core    = { path = "../iv-core" }
+libheif-rs = { version = "1", optional = true }

@@ -56,6 +56,20 @@ impl ImageList {
         self.entries.get(self.current).map(PathBuf::as_path)
     }
 
+    /// Remove the current entry from the list and return its path.
+    /// The index stays at the same position (now pointing to the next image),
+    /// or clamps to the new last element if we were at the end.
+    pub fn remove_current(&mut self) -> Option<PathBuf> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let removed = self.entries.remove(self.current);
+        if !self.entries.is_empty() && self.current >= self.entries.len() {
+            self.current = self.entries.len() - 1;
+        }
+        Some(removed)
+    }
+
     /// Move by `delta` steps (wraps around). Returns the new current path.
     pub fn advance(&mut self, delta: i64) -> Option<&Path> {
         if self.entries.is_empty() {

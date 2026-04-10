@@ -1,0 +1,144 @@
+# Dockerfile.package — Build PikaViewer and produce .deb + .AppImage
+#
+# Usage:
+#   docker --context default build -f Dockerfile.package -t pikaviewer-package .
+#   docker --context default create --name pv-pkg pikaviewer-package
+#   docker --context default cp pv-pkg:/out/. dist/linux/
+#   docker --context default rm pv-pkg
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libvulkan-dev \
+    mesa-vulkan-drivers \
+    libx11-dev \
+    libxrandr-dev \
+    libxcursor-dev \
+    libxi-dev \
+    libxxf86vm-dev \
+    libwayland-dev \
+    libxkbcommon-dev \
+    libxkbcommon-x11-dev \
+    libudev-dev \
+    libheif-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release --features iv-app/heic
+
+# ── Package stage ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS packager
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    file \
+    libfuse2 \
+    libheif1 \
+    patchelf \
+ && rm -rf /var/lib/apt/lists/*
+
+# Download appimagetool and extract it (FUSE unavailable in Docker)
+ADD https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage /tmp/appimagetool.AppImage
+RUN chmod +x /tmp/appimagetool.AppImage && \
+    cd /tmp && ./appimagetool.AppImage --appimage-extract && \
+    mv /tmp/squashfs-root /opt/appimagetool
+
+# Pre-download AppImage runtime (appimagetool can't fetch it during RUN)
+ADD https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 /opt/runtime-x86_64
+
+WORKDIR /pkg
+
+# Bring in the binary and assets
+COPY --from=builder /build/target/release/pikaviewer /pkg/pikaviewer
+COPY --from=builder /build/assets/icon.png /pkg/icon.png
+
+# Version (can be overridden with --build-arg VERSION=x.y.z)
+ARG VERSION=0.1.0
+ARG ARCH=amd64
+
+# ── .deb ─────────────────────────────────────────────────────────────────────
+RUN mkdir -p /pkg/deb/DEBIAN \
+             /pkg/deb/usr/bin \
+             /pkg/deb/usr/share/applications \
+             /pkg/deb/usr/share/icons/hicolor/256x256/apps \
+             /pkg/deb/usr/share/icons/hicolor/512x512/apps \
+             /pkg/deb/usr/share/icons/hicolor/1024x1024/apps
+
+RUN cp /pkg/pikaviewer /pkg/deb/usr/bin/pikaviewer && \
+    chmod 755 /pkg/deb/usr/bin/pikaviewer
+
+RUN cp /pkg/icon.png /pkg/deb/usr/share/icons/hicolor/1024x1024/apps/pikaviewer.png
+
+# .desktop file
+RUN printf '[Desktop Entry]\n\
+Type=Application\n\
+Name=PikaViewer\n\
+Comment=A fast, cross-platform image viewer\n\
+Exec=pikaviewer %%f\n\
+Icon=pikaviewer\n\
+Terminal=false\n\
+Categories=Graphics;Viewer;\n\
+MimeType=image/jpeg;image/png;image/gif;image/bmp;image/tiff;image/webp;image/x-icon;image/vnd.microsoft.icon;image/heic;image/heif;image/avif;\n' \
+    > /pkg/deb/usr/share/applications/pikaviewer.desktop
+
+# Control file
+RUN INSTALLED_SIZE=$(du -sk /pkg/deb/usr | awk '{print $1}') && \
+    printf 'Package: pikaviewer\n\
+Version: %s\n\
+Section: graphics\n\
+Priority: optional\n\
+Architecture: %s\n\
+Installed-Size: %s\n\
+Depends: libvulkan1, mesa-vulkan-drivers, libx11-6, libwayland-client0, libxkbcommon0\n\
+Recommends: libheif1\n\
+Maintainer: astrolabius <dev@astrolabius.xyz>\n\
+Description: A fast, cross-platform image viewer\n\
+ PikaViewer is a lightweight GPU-accelerated image viewer\n\
+ built with Rust, wgpu, and egui. Supports JPEG, PNG, GIF,\n\
+ BMP, TIFF, WebP, ICO, and optionally HEIC/HEIF/AVIF.\n' \
+    "$VERSION" "$ARCH" "$INSTALLED_SIZE" \
+    > /pkg/deb/DEBIAN/control
+
+RUN dpkg-deb --build /pkg/deb /pkg/pikaviewer_${VERSION}_${ARCH}.deb
+
+# ── AppImage ─────────────────────────────────────────────────────────────────
+RUN mkdir -p /pkg/AppDir/usr/bin \
+             /pkg/AppDir/usr/share/applications \
+             /pkg/AppDir/usr/share/icons/hicolor/256x256/apps
+
+RUN cp /pkg/pikaviewer /pkg/AppDir/usr/bin/pikaviewer && \
+    chmod 755 /pkg/AppDir/usr/bin/pikaviewer
+
+RUN cp /pkg/icon.png /pkg/AppDir/usr/share/icons/hicolor/256x256/apps/pikaviewer.png && \
+    cp /pkg/icon.png /pkg/AppDir/pikaviewer.png
+
+RUN cp /pkg/deb/usr/share/applications/pikaviewer.desktop /pkg/AppDir/pikaviewer.desktop
+
+# AppRun entry point
+RUN printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/pikaviewer" "$@"\n' \
+    > /pkg/AppDir/AppRun && chmod +x /pkg/AppDir/AppRun
+
+# Bundle libheif and all its transitive deps into the AppImage
+RUN mkdir -p /pkg/AppDir/usr/lib && \
+    ldd /pkg/AppDir/usr/bin/pikaviewer | \
+    awk '/=>/ && !/linux-vdso|ld-linux/ {print $3}' | \
+    while read -r lib; do \
+        case "$(basename "$lib")" in \
+            libc.so*|libm.so*|libdl.so*|librt.so*|libpthread.so*|libgcc_s.so*|libstdc++.so*) ;; \
+            *) cp "$lib" /pkg/AppDir/usr/lib/ ;; \
+        esac; \
+    done
+
+# Patch the binary rpath so it finds bundled libs
+RUN patchelf --set-rpath '$ORIGIN/../lib' /pkg/AppDir/usr/bin/pikaviewer
+
+# Update AppRun to set LD_LIBRARY_PATH as fallback
+RUN printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexport LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH}"\nexec "$HERE/usr/bin/pikaviewer" "$@"\n' \
+    > /pkg/AppDir/AppRun
+
+RUN ARCH=x86_64 /opt/appimagetool/AppRun --no-appstream --runtime-file /opt/runtime-x86_64 /pkg/AppDir /pkg/PikaViewer-${VERSION}-x86_64.AppImage
+
+# ── Output ───────────────────────────────────────────────────────────────────
+RUN mkdir -p /out && cp /pkg/*.deb /pkg/*.AppImage /out/

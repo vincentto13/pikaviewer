@@ -15,11 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon-dev \
     libxkbcommon-x11-dev \
     libudev-dev \
+    libheif-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --features iv-app/heic
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -33,8 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxi6 \
     libwayland-client0 \
     libxkbcommon0 \
+    libheif1 \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/imageviewer /usr/local/bin/imageviewer
+COPY --from=builder /build/target/release/pikaviewer /usr/local/bin/pikaviewer
 
-ENTRYPOINT ["imageviewer"]
+ENTRYPOINT ["pikaviewer"]

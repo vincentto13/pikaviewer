@@ -9,6 +9,14 @@ use iv_core::format::DecodedImage;
 
 use crate::display_mode::{compute_layout, DisplayMode, QuadNdc};
 
+/// Shared GPU state that can be used by multiple windows (main + settings).
+pub struct GpuContext {
+    pub instance: wgpu::Instance,
+    pub adapter:  wgpu::Adapter,
+    pub device:   wgpu::Device,
+    pub queue:    wgpu::Queue,
+}
+
 // ── Vertex layout ─────────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -56,21 +64,22 @@ fn quad_vertices(q: QuadNdc, rotation: u32) -> [Vertex; 4] {
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    surface:           wgpu::Surface<'static>,
-    device:            wgpu::Device,
-    queue:             wgpu::Queue,
-    config:            wgpu::SurfaceConfiguration,
+    // Drop order: GPU resources must drop before `gpu` (Device/Queue).
+    // Rust drops fields in declaration order.
+    image_state:       Option<ImageState>,
+    egui_renderer:     egui_wgpu::Renderer,
     pipeline:          wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    egui_renderer:     egui_wgpu::Renderer,
+    surface:           wgpu::Surface<'static>,
+    config:            wgpu::SurfaceConfiguration,
+    gpu:               Arc<GpuContext>,
 
-    image_state: Option<ImageState>,
-
-    pub display_mode: DisplayMode,
-    pub image_size:   Option<(u32, u32)>,
+    pub display_mode:   DisplayMode,
+    pub fit_to_image:   bool,
+    pub image_size:     Option<(u32, u32)>,
     /// 0 = 0°, 1 = 90°CW, 2 = 180°, 3 = 270°CW
-    pub rotation:     u32,
-    screen_size:      (u32, u32),
+    pub rotation:       u32,
+    screen_size:        (u32, u32),
 }
 
 struct ImageState {
@@ -79,7 +88,8 @@ struct ImageState {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> Result<Self> {
+    /// Returns the GPU context (shared with other windows) alongside Self.
+    pub fn new(window: Arc<Window>) -> Result<(Self, Arc<GpuContext>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -126,9 +136,11 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        let gpu = Arc::new(GpuContext { instance, adapter, device, queue });
+
         // ── Image bind group layout ───────────────────────────────────────────
 
-        let bind_group_layout = device.create_bind_group_layout(
+        let bind_group_layout = gpu.device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
                 label:   Some("image_bgl"),
                 entries: &[
@@ -156,7 +168,7 @@ impl Renderer {
 
         // ── Image render pipeline ─────────────────────────────────────────────
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some("image_shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/image.wgsl").into(),
@@ -164,14 +176,14 @@ impl Renderer {
         });
 
         let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label:                Some("image_layout"),
                 bind_group_layouts:   &[&bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label:  Some("image_pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
@@ -203,27 +215,28 @@ impl Renderer {
         // ── egui renderer ─────────────────────────────────────────────────────
 
         // 5th arg = dithering (added in wgpu 22 / egui-wgpu 0.29)
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, None, 1, false);
 
         let screen_size = window
             .current_monitor()
             .map(|m| { let s = m.size(); (s.width, s.height) })
             .unwrap_or((1920, 1080));
 
-        Ok(Self {
+        let renderer = Self {
             surface,
-            device,
-            queue,
+            gpu: gpu.clone(),
             config,
             pipeline,
             bind_group_layout,
             egui_renderer,
-            image_state:  None,
-            display_mode: DisplayMode::Regular,
-            image_size:   None,
-            rotation:     0,
+            image_state:    None,
+            display_mode:   DisplayMode::Window,
+            fit_to_image:   true,
+            image_size:     None,
+            rotation:       0,
             screen_size,
-        })
+        };
+        Ok((renderer, gpu))
     }
 
     // ── Public controls ───────────────────────────────────────────────────────
@@ -231,8 +244,8 @@ impl Renderer {
     pub fn set_image(&mut self, image: &DecodedImage) {
         self.image_size = Some((image.width, image.height));
 
-        let texture = self.device.create_texture_with_data(
-            &self.queue,
+        let texture = self.gpu.device.create_texture_with_data(
+            &self.gpu.queue,
             &wgpu::TextureDescriptor {
                 label:            Some("image_texture"),
                 size:             wgpu::Extent3d {
@@ -252,7 +265,7 @@ impl Renderer {
         );
 
         let view    = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label:           Some("image_sampler"),
             address_mode_u:  wgpu::AddressMode::ClampToEdge,
             address_mode_v:  wgpu::AddressMode::ClampToEdge,
@@ -261,7 +274,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label:   Some("image_bg"),
             layout:  &self.bind_group_layout,
             entries: &[
@@ -276,7 +289,7 @@ impl Renderer {
             ],
         });
 
-        let vertex_buf = self.device.create_buffer_init(
+        let vertex_buf = self.gpu.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label:    Some("vertex_buf"),
                 contents: bytemuck::cast_slice(&quad_vertices(self.current_quad(), self.rotation)),
@@ -285,6 +298,13 @@ impl Renderer {
         );
 
         self.image_state = Some(ImageState { bind_group, vertex_buf });
+    }
+
+    /// Drop the current image so the renderer draws only the clear colour.
+    pub fn clear_image(&mut self) {
+        self.image_state = None;
+        self.image_size  = None;
+        self.rotation    = 0;
     }
 
     /// Rotate by one 90° step. `clockwise = true` → +90°CW.
@@ -301,12 +321,12 @@ impl Renderer {
         if new_w == 0 || new_h == 0 { return; }
         self.config.width  = new_w;
         self.config.height = new_h;
-        self.surface.configure(&self.device, &self.config);
+        self.surface.configure(&self.gpu.device, &self.config);
         self.refresh_vertex_buf();
     }
 
-    /// Returns the window size to request for the current image + mode (Regular
-    /// mode only). `None` means don't resize.
+    /// Returns the window size to request for the current image + mode.
+    /// `None` means don't resize (Fullscreen, or Window+fixed).
     pub fn compute_window_size(&self) -> Option<(u32, u32)> {
         let img = self.effective_image_size()?;
         compute_layout(
@@ -314,8 +334,14 @@ impl Renderer {
             img,
             (self.config.width, self.config.height),
             self.screen_size,
+            self.fit_to_image,
         )
         .request_size
+    }
+
+    /// Shared GPU context for other windows to reuse.
+    pub fn gpu(&self) -> &Arc<GpuContext> {
+        &self.gpu
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
@@ -336,19 +362,19 @@ impl Renderer {
 
         // Upload egui texture changes
         for (id, delta) in &tex_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+            self.egui_renderer.update_texture(&self.gpu.device, &self.gpu.queue, *id, delta);
         }
         for id in &tex_delta.free {
             self.egui_renderer.free_texture(id);
         }
 
-        let mut encoder = self.device.create_command_encoder(
+        let mut encoder = self.gpu.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("render_encoder") },
         );
 
         // Upload egui vertex/index buffers into the encoder
         self.egui_renderer.update_buffers(
-            &self.device, &self.queue, &mut encoder, paint_jobs, screen_desc,
+            &self.gpu.device, &self.gpu.queue, &mut encoder, paint_jobs, screen_desc,
         );
 
         {
@@ -381,7 +407,7 @@ impl Renderer {
             self.egui_renderer.render(&mut pass, paint_jobs, screen_desc);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
     }
@@ -402,6 +428,7 @@ impl Renderer {
                 img,
                 (self.config.width, self.config.height),
                 self.screen_size,
+                self.fit_to_image,
             ).quad,
         }
     }
@@ -410,7 +437,7 @@ impl Renderer {
         let quad     = self.current_quad();
         let rotation = self.rotation;
         if let Some(state) = &self.image_state {
-            self.queue.write_buffer(
+            self.gpu.queue.write_buffer(
                 &state.vertex_buf,
                 0,
                 bytemuck::cast_slice(&quad_vertices(quad, rotation)),
