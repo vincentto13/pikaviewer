@@ -46,6 +46,14 @@ struct ImageInfo {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppStatus {
+    Ready,
+    Loading,
+    EmptyFolder,
+    FolderNotFound,
+}
+
 type StartupResult = Result<ImageList, String>;
 
 pub struct App {
@@ -63,8 +71,7 @@ pub struct App {
     image_list: Option<ImageList>,
     prefetch:   Option<PrefetchCache>,
     startup_rx: Option<mpsc::Receiver<StartupResult>>,
-    loading:    bool,
-    empty_folder: bool,
+    status:     AppStatus,
 
     egui_ctx:   egui::Context,
 
@@ -119,8 +126,7 @@ impl App {
             image_list: None,
             prefetch:   None,
             startup_rx: None,
-            loading:    false,
-            empty_folder: false,
+            status:     AppStatus::Ready,
             egui_ctx,
             egui_state: None,
             settings,
@@ -147,7 +153,7 @@ impl App {
         if let Some(ref mut cache) = self.prefetch {
             if let Some(entry) = cache.get(&path) {
                 log::debug!("cache hit: {}", path.display());
-                self.loading = false;
+                self.status = AppStatus::Ready;
                 let result = DecodeResult {
                     path: path.clone(),
                     image: Ok(entry.image),
@@ -162,7 +168,7 @@ impl App {
             log::debug!("cache miss: {}", path.display());
             cache.request(path.clone());
             cache.waiting_for_current = true;
-            self.loading = true;
+            self.status = AppStatus::Loading;
 
             // Update overlay immediately so filename/index reflect the target
             let filename = path.file_name()
@@ -175,7 +181,6 @@ impl App {
                 w.set_title(&format!("{APP_NAME} - {filename} {index}"));
                 w.request_redraw();
             }
-            return;
         }
 
     }
@@ -186,7 +191,7 @@ impl App {
             Ok(img) => img,
             Err(e) => {
                 log::error!("decode {}: {e}", result.path.display());
-                self.loading = false;
+                self.status = AppStatus::Ready;
                 return;
             }
         };
@@ -216,7 +221,7 @@ impl App {
             .unwrap_or_default();
         self.current_filename = filename.clone();
         self.current_index    = index.clone();
-        self.loading = false;
+        self.status = AppStatus::Ready;
 
         if let Some(w) = &self.window {
             w.set_title(&format!("{APP_NAME} - {filename} {index}"));
@@ -253,7 +258,7 @@ impl App {
         let registry = Arc::clone(&self.registry);
         let (tx, rx) = mpsc::channel();
         self.startup_rx = Some(rx);
-        self.loading = true;
+        self.status = AppStatus::Loading;
 
         std::thread::Builder::new()
             .name("startup-scan".into())
@@ -381,13 +386,12 @@ impl App {
         let pending_delete = self.pending_delete;
         let delete_name    = self.current_filename.clone();
         let show_help      = self.show_help;
-        let loading        = self.loading;
-        let empty_folder   = self.empty_folder;
+        let status         = self.status;
 
         let raw_input   = egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_ui(ctx, &filename, &index, mode_changed, mode_label, show_info, image_info,
-                    pending_delete, &delete_name, show_help, loading, empty_folder);
+                    pending_delete, &delete_name, show_help, status);
         });
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -458,8 +462,7 @@ fn draw_ui(
     pending_delete: bool,
     delete_name:    &str,
     show_help:      bool,
-    loading:        bool,
-    empty_folder:   bool,
+    status:         AppStatus,
 ) {
     // Use egui's own screen rect — always correct regardless of DPI scaling.
     let win_w = ctx.screen_rect().width();
@@ -635,22 +638,23 @@ fn draw_ui(
             });
     }
 
-    // ── Loading / empty indicator — centred ────────────────────────────────────
-    if empty_folder {
-        egui::Area::new(egui::Id::new("empty_overlay"))
+    // ── Status indicator — centred ─────────────────────────────────────────────
+    let status_text = match status {
+        AppStatus::Loading       => Some("Loading\u{2026}"),
+        AppStatus::EmptyFolder   => Some("No images found"),
+        AppStatus::FolderNotFound => Some("Folder not found"),
+        AppStatus::Ready         => None,
+    };
+    if let Some(text) = status_text {
+        egui::Area::new(egui::Id::new("status_overlay"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .interactable(false)
             .show(ctx, |ui| {
-                overlay_label(ui, "No images found", 200, 20.0);
+                overlay_label(ui, text, 200, 20.0);
             });
-    } else if loading {
-        egui::Area::new(egui::Id::new("loading_overlay"))
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .interactable(false)
-            .show(ctx, |ui| {
-                overlay_label(ui, "Loading\u{2026}", 200, 20.0);
-            });
-        ctx.request_repaint();
+        if status == AppStatus::Loading {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -905,7 +909,7 @@ impl ApplicationHandler for App {
             let registry = Arc::clone(&self.registry);
             let (tx, rx) = mpsc::channel();
             self.startup_rx = Some(rx);
-            self.loading = true;
+            self.status = AppStatus::Loading;
 
             std::thread::Builder::new()
                 .name("startup-scan".into())
@@ -1095,8 +1099,8 @@ impl ApplicationHandler for App {
                     Ok(list) => {
                         if list.is_empty() {
                             log::warn!("no supported images found");
-                            self.loading = false;
-                            self.empty_folder = true;
+                            self.status = AppStatus::Ready;
+                            self.status = AppStatus::EmptyFolder;
                             if let Some(w) = &self.window { w.request_redraw(); }
                         } else {
                             log::info!("directory scan complete: {} images", list.len());
@@ -1106,7 +1110,8 @@ impl ApplicationHandler for App {
                     }
                     Err(e) => {
                         log::error!("build image list: {e}");
-                        self.loading = false;
+                        self.status = AppStatus::FolderNotFound;
+                        if let Some(w) = &self.window { w.request_redraw(); }
                     }
                 }
             }
@@ -1139,7 +1144,7 @@ impl ApplicationHandler for App {
             .unwrap_or(false);
 
         // Repaint if mode indicator is fading or we're waiting for a decode
-        if needs_repaint || self.loading {
+        if needs_repaint || self.status == AppStatus::Loading {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
