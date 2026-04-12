@@ -14,6 +14,7 @@ use iv_core::{format::PluginRegistry, image_list::ImageList};
 use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
+use crate::prefetch::{self, ExifData, PrefetchCache, DecodeResult};
 use crate::settings_window::SettingsWindow;
 
 const APP_NAME: &str = "PikaViewer";
@@ -33,34 +34,6 @@ const MIN_WINDOW_W: u32 = 600;
 const MIN_WINDOW_H: u32 = 450;
 
 // ── Image info ───────────────────────────────────────────────────────────────
-
-/// EXIF fields extracted from the image file. All optional — not all images
-/// or formats carry EXIF data.
-#[derive(Default)]
-struct ExifData {
-    camera_make:   Option<String>,
-    camera_model:  Option<String>,
-    lens_model:    Option<String>,
-    exposure_time: Option<String>,   // e.g. "1/250 s"
-    f_number:      Option<String>,   // e.g. "f/2.8"
-    iso:           Option<String>,   // e.g. "400"
-    focal_length:  Option<String>,   // e.g. "50 mm"
-    date_taken:    Option<String>,
-    /// Raw EXIF orientation value (1–8). 0 = absent.
-    orientation:   u32,
-}
-
-/// Map an EXIF orientation tag value to a rotation step count (0–3, each step = 90° CW).
-/// Orientations involving a mirror flip (2, 4, 5, 7) are treated as the nearest
-/// pure rotation since the renderer does not support flipping.
-fn orientation_rotation(orientation: u32) -> u32 {
-    match orientation {
-        3 => 2,  // 180°
-        6 => 1,  // 90° CW
-        8 => 3,  // 270° CW (= 90° CCW)
-        _ => 0,  // 1 = normal; 2/4/5/7 = flip variants → ignore flip, treat as 0°
-    }
-}
 
 /// Metadata about the currently loaded image, shown in the info panel.
 struct ImageInfo {
@@ -84,8 +57,10 @@ pub struct App {
     egui_state: Option<egui_winit::State>,
     window:   Option<Arc<Window>>,
 
-    registry:   PluginRegistry,
+    registry:   Arc<PluginRegistry>,
     image_list: Option<ImageList>,
+    prefetch:   Option<PrefetchCache>,
+    loading:    bool,
 
     egui_ctx:   egui::Context,
 
@@ -107,13 +82,14 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // wgpu Surfaces hold references to the Wayland/EGL display.
-        // If they drop after winit tears down its Wayland connection,
-        // the EGL cleanup segfaults.  Force the correct order:
-        // 1. settings window (Surface + egui renderer)
-        // 2. main renderer   (Surface + Pipeline + textures)
-        // 3. GPU context     (Device/Queue)
-        // 4. window + egui_state drop naturally after this
+        // Drop prefetch first — dropping request_tx causes worker thread exit.
+        // Then wgpu resources in dependency order:
+        // 1. prefetch       (worker thread, no GPU deps)
+        // 2. settings window (Surface + egui renderer)
+        // 3. main renderer   (Surface + Pipeline + textures)
+        // 4. GPU context     (Device/Queue)
+        // 5. window + egui_state drop naturally after this
+        drop(self.prefetch.take());
         drop(self.settings_window.take());
         drop(self.renderer.take());
         drop(self.gpu.take());
@@ -121,7 +97,7 @@ impl Drop for App {
 }
 
 impl App {
-    pub fn new(start_path: Option<PathBuf>, registry: PluginRegistry) -> Self {
+    pub fn new(start_path: Option<PathBuf>, registry: Arc<PluginRegistry>) -> Self {
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals {
             window_shadow: egui::epaint::Shadow::NONE,
@@ -137,6 +113,8 @@ impl App {
             gpu:      None,
             registry,
             image_list: None,
+            prefetch:   None,
+            loading:    false,
             egui_ctx,
             egui_state: None,
             settings,
@@ -155,17 +133,43 @@ impl App {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn load_current(&mut self) {
-        let (Some(list), Some(renderer)) =
-            (self.image_list.as_mut(), self.renderer.as_mut())
-        else { return };
-
+        let Some(list) = self.image_list.as_ref() else { return };
         let Some(path) = list.current() else { return };
         let path = path.to_path_buf();
 
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        // Try the prefetch cache first
+        if let Some(ref mut cache) = self.prefetch {
+            if let Some(entry) = cache.get(&path) {
+                self.loading = false;
+                let result = DecodeResult {
+                    path: path.clone(),
+                    image: Ok(entry.image),
+                    exif: entry.exif,
+                    file_size: entry.file_size,
+                };
+                self.apply_decode_result(result);
+                self.trigger_prefetch();
+                return;
+            }
+            // Cache miss — request background decode
+            cache.request(path);
+            cache.waiting_for_current = true;
+            self.loading = true;
+            if let Some(w) = &self.window { w.request_redraw(); }
+            return;
+        }
+
+        // Fallback: no prefetch cache (shouldn't happen after resumed)
+        self.load_current_sync();
+    }
+
+    /// Synchronous fallback for load_current (used before prefetch is initialized).
+    fn load_current_sync(&mut self) {
+        let Some(list) = self.image_list.as_ref() else { return };
+        if self.renderer.is_none() { return; }
+
+        let Some(path) = list.current() else { return };
+        let path = path.to_path_buf();
 
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
@@ -182,39 +186,78 @@ impl App {
 
         match plugin.decode(&data) {
             Ok(image) => {
-                let exif = extract_exif(&data);
-
-                // Apply EXIF auto-rotation before set_image() so the vertex
-                // buffer is built with the correct UV mapping from the start.
-                renderer.rotation = orientation_rotation(exif.orientation);
-
-                self.image_info = Some(ImageInfo {
-                    width:     image.width,
-                    height:    image.height,
-                    file_size,
-                    file_path: path.clone(),
+                let exif = prefetch::extract_exif(&data);
+                let result = DecodeResult {
+                    path,
+                    image: Ok(image),
                     exif,
-                });
-
-                renderer.set_image(&image);
-
-                let index = format!("[{}/{}]", list.position(), list.len());
-                self.current_filename = filename.clone();
-                self.current_index    = index.clone();
-
-                if let Some(w) = &self.window {
-                    // Window title: "AppName - filename.ext [pos/total]"
-                    w.set_title(&format!("{APP_NAME} - {filename} {index}"));
-
-                    if let Some((new_w, new_h)) = renderer.compute_window_size() {
-                        let _ = w.request_inner_size(clamped_size(w, new_w, new_h));
-                        // Clamp after requesting resize (position may become stale)
-                        clamp_to_screen(w);
-                    }
-                    w.request_redraw();
-                }
+                    file_size,
+                };
+                self.apply_decode_result(result);
             }
             Err(e) => log::error!("decode {}: {e}", path.display()),
+        }
+    }
+
+    /// Apply a completed decode result: set texture, EXIF rotation, update overlays.
+    fn apply_decode_result(&mut self, result: DecodeResult) {
+        let image = match result.image {
+            Ok(img) => img,
+            Err(e) => {
+                log::error!("decode {}: {e}", result.path.display());
+                self.loading = false;
+                return;
+            }
+        };
+
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let list = self.image_list.as_ref();
+
+        renderer.rotation = prefetch::orientation_rotation(result.exif.orientation);
+
+        let filename = result.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| result.path.display().to_string());
+
+        self.image_info = Some(ImageInfo {
+            width:     image.width,
+            height:    image.height,
+            file_size: result.file_size,
+            file_path: result.path,
+            exif:      result.exif,
+        });
+
+        renderer.set_image(&image);
+
+        let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
+            .unwrap_or_default();
+        self.current_filename = filename.clone();
+        self.current_index    = index.clone();
+        self.loading = false;
+
+        if let Some(w) = &self.window {
+            w.set_title(&format!("{APP_NAME} - {filename} {index}"));
+
+            if let Some((new_w, new_h)) = renderer.compute_window_size() {
+                let _ = w.request_inner_size(clamped_size(w, new_w, new_h));
+                clamp_to_screen(w);
+            }
+            w.request_redraw();
+        }
+    }
+
+    /// Request prefetch of adjacent images (N+1, N-1).
+    fn trigger_prefetch(&mut self) {
+        let (Some(list), Some(cache)) =
+            (self.image_list.as_ref(), self.prefetch.as_mut())
+        else { return };
+
+        if let Some(next) = list.peek_offset(1) {
+            cache.request(next.to_path_buf());
+        }
+        if let Some(prev) = list.peek_offset(-1) {
+            cache.request(prev.to_path_buf());
         }
     }
 
@@ -223,15 +266,16 @@ impl App {
     #[cfg(target_os = "macos")]
     fn load_path(&mut self, path: PathBuf) {
         let result = if path.is_file() {
-            ImageList::from_file(&path, &self.registry)
+            ImageList::from_file(&path, &*self.registry)
         } else {
-            ImageList::from_directory(&path, &self.registry)
+            ImageList::from_directory(&path, &*self.registry)
         };
         match result {
             Ok(list) => {
                 if list.is_empty() { log::warn!("no supported images at {}", path.display()); return; }
                 self.image_list = Some(list);
                 if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
+                if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
                 self.load_current();
             }
             Err(e) => log::error!("load_path {}: {e}", path.display()),
@@ -240,6 +284,7 @@ impl App {
 
     fn navigate(&mut self, delta: i64) {
         if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
+        if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
         if let Some(l) = self.image_list.as_mut() { l.advance(delta); }
         self.load_current();
     }
@@ -308,6 +353,8 @@ impl App {
         }
         log::info!("deleted: {:?}", removed);
 
+        if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
+
         if list.is_empty() {
             // No images left — clear the display
             if let Some(r) = self.renderer.as_mut() {
@@ -344,11 +391,12 @@ impl App {
         let pending_delete = self.pending_delete;
         let delete_name    = self.current_filename.clone();
         let show_help      = self.show_help;
+        let loading        = self.loading;
 
         let raw_input   = egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_ui(ctx, &filename, &index, mode_changed, mode_label, show_info, image_info,
-                    pending_delete, &delete_name, show_help);
+                    pending_delete, &delete_name, show_help, loading);
         });
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -419,6 +467,7 @@ fn draw_ui(
     pending_delete: bool,
     delete_name:    &str,
     show_help:      bool,
+    loading:        bool,
 ) {
     // Use egui's own screen rect — always correct regardless of DPI scaling.
     let win_w = ctx.screen_rect().width();
@@ -593,6 +642,17 @@ fn draw_ui(
                 );
             });
     }
+
+    // ── Loading indicator — centred, shown during background decode ──────────
+    if loading {
+        egui::Area::new(egui::Id::new("loading_overlay"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                overlay_label(ui, "Loading\u{2026}", 200, 20.0);
+            });
+        ctx.request_repaint();
+    }
 }
 
 /// Draw a single key label inside a rounded pill (bright background rectangle).
@@ -699,80 +759,6 @@ fn draw_info_panel(ctx: &egui::Context, info: &ImageInfo) {
                 }
             }
         });
-}
-
-fn extract_exif(data: &[u8]) -> ExifData {
-    let mut out = ExifData::default();
-
-    let reader = exif::Reader::new();
-    let mut cursor = std::io::Cursor::new(data);
-    let exif = match reader.read_from_container(&mut cursor) {
-        Ok(e)  => e,
-        Err(_) => return out,  // not an error — many images have no EXIF
-    };
-
-    let str_field = |tag| -> Option<String> {
-        exif.get_field(tag, exif::In::PRIMARY)
-            .map(|f| f.display_value().with_unit(&exif).to_string())
-    };
-
-    // Orientation — Short value, default absent = 1 (normal)
-    out.orientation = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| match &f.value {
-            exif::Value::Short(v) if !v.is_empty() => Some(v[0] as u32),
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    out.camera_make  = str_field(exif::Tag::Make);
-    out.camera_model = str_field(exif::Tag::Model);
-    out.lens_model   = str_field(exif::Tag::LensModel);
-    out.date_taken   = str_field(exif::Tag::DateTimeOriginal);
-
-    // Exposure time — format as fraction if < 1s
-    out.exposure_time = exif.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY)
-        .and_then(|f| match &f.value {
-            exif::Value::Rational(v) if !v.is_empty() => {
-                let r = v[0];
-                if r.num == 0 {
-                    None
-                } else if r.denom > r.num {
-                    // e.g. 1/250
-                    let reduced = r.denom / r.num;
-                    Some(format!("1/{reduced} s"))
-                } else {
-                    // e.g. 2s
-                    Some(format!("{:.1} s", r.num as f64 / r.denom as f64))
-                }
-            }
-            _ => None,
-        });
-
-    // F-number
-    out.f_number = exif.get_field(exif::Tag::FNumber, exif::In::PRIMARY)
-        .and_then(|f| match &f.value {
-            exif::Value::Rational(v) if !v.is_empty() => {
-                let r = v[0];
-                Some(format!("f/{:.1}", r.num as f64 / r.denom as f64))
-            }
-            _ => None,
-        });
-
-    // ISO
-    out.iso = exif.get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY)
-        .map(|f| f.display_value().to_string());
-
-    // Focal length in mm
-    out.focal_length = exif.get_field(exif::Tag::FocalLength, exif::In::PRIMARY)
-        .and_then(|f| match &f.value {
-            exif::Value::Rational(v) if !v.is_empty() => {
-                let r = v[0];
-                Some(format!("{:.0} mm", r.num as f64 / r.denom as f64))
-            }
-            _ => None,
-        });
-
-    out
 }
 
 fn simplify_ratio(w: u32, h: u32) -> (u32, u32) {
@@ -914,12 +900,13 @@ impl ApplicationHandler for App {
         self.renderer   = Some(renderer);
         self.gpu        = Some(gpu);
         self.egui_state = Some(egui_state);
+        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry)));
 
         if let Some(path) = self.start_path.clone() {
             let result = if path.is_file() {
-                ImageList::from_file(&path, &self.registry)
+                ImageList::from_file(&path, &*self.registry)
             } else {
-                ImageList::from_directory(&path, &self.registry)
+                ImageList::from_directory(&path, &*self.registry)
             };
             match result {
                 Ok(list) => {
@@ -1096,11 +1083,34 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Poll background decode results — collect first to avoid borrow conflict
+        let mut current_result: Option<DecodeResult> = None;
+        if let Some(ref mut cache) = self.prefetch {
+            let results = cache.poll();
+            let current_path = self.image_list.as_ref()
+                .and_then(|l| l.current())
+                .map(|p| p.to_path_buf());
+
+            for result in results {
+                if current_path.as_ref() == Some(&result.path) {
+                    cache.waiting_for_current = false;
+                    current_result = Some(result);
+                } else {
+                    cache.insert(result);
+                }
+            }
+        }
+        if let Some(result) = current_result {
+            self.apply_decode_result(result);
+            self.trigger_prefetch();
+        }
+
         let needs_repaint = self.mode_changed_at
             .map(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS)
             .unwrap_or(false);
 
-        if needs_repaint {
+        // Repaint if mode indicator is fading or we're waiting for a decode
+        if needs_repaint || self.loading {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }

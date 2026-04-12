@@ -70,6 +70,14 @@ impl ImageList {
         Some(removed)
     }
 
+    /// Peek at the path `delta` steps from current without moving the cursor.
+    pub fn peek_offset(&self, delta: i64) -> Option<&Path> {
+        if self.entries.is_empty() { return None; }
+        let len = self.entries.len() as i64;
+        let idx = ((self.current as i64 + delta).rem_euclid(len)) as usize;
+        self.entries.get(idx).map(PathBuf::as_path)
+    }
+
     /// Move by `delta` steps (wraps around). Returns the new current path.
     pub fn advance(&mut self, delta: i64) -> Option<&Path> {
         if self.entries.is_empty() {

@@ -175,16 +175,20 @@ Or: Finder → Get Info on any image → Open with → Change All.
 - [x] Minimum window size 600×450 (logical) enforced on creation and every resize
 - [x] Regular mode aspect ratio preserved when window is larger than image (min-size letterbox)
 - [x] Pushed to GitLab dev branch
+- [x] EXIF data panel — camera, lens, exposure, date taken; shown in info panel
+- [x] EXIF auto-rotation — reads orientation tag, applies rotation on load
+- [x] Config file — TOML at `~/.config/pikaviewer/config.toml`
+- [x] HEIC/AVIF — `iv-format-heic` crate using libheif (optional feature)
+- [x] File associations — `.desktop` + `xdg-mime` (Linux); macOS done via `Info.plist`
+- [x] Linux packaging — `.deb` + `.AppImage` via Docker
+- [x] macOS packaging — `.app` bundle + `.dmg` with icon generation
+- [x] GitHub CI — check/clippy/test + release workflow for v* tags
+- [x] Async prefetch cache — background decode thread, LRU cache (5 entries), N±1 prefetch, loading indicator
 
 ## Planned next phases
 
-1. **Async prefetch cache** — rayon thread pool, preload N±1 images
-2. **Config file** — TOML at `~/.config/pikaviewer/config.toml`
-3. **RAW formats** — `iv-format-raw` crate using LibRaw (LGPL, optional feature)
-4. **HEIC/AVIF** — `iv-format-heic` crate using libheif (LGPL, optional feature)
-5. **File associations** — `.desktop` + `xdg-mime` (Linux); macOS done via `Info.plist` in package script
-6. **Zoom/pan** — Viewport struct; shader Transform uniform already designed for it
-7. **EXIF auto-rotation** — read from `ImageMetadata`, apply on load
+1. **RAW formats** — `iv-format-raw` crate using LibRaw (LGPL, optional feature)
+2. **Zoom/pan** — Viewport struct; shader Transform uniform already designed for it
 
 ## macOS file-open mechanism (`macos_events.rs`)
 

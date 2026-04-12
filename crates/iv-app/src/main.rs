@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use iv_core::format::PluginRegistry;
@@ -8,6 +9,7 @@ use winit::event_loop::EventLoop;
 mod app;
 mod config;
 mod desktop_integration;
+mod prefetch;
 mod settings_window;
 use app::App;
 
@@ -80,6 +82,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     macos_events::register();
 
-    event_loop.run_app(&mut App::new(start_path, build_registry()))?;
+    event_loop.run_app(&mut App::new(start_path, Arc::new(build_registry())))?;
     Ok(())
 }
