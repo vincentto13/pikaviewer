@@ -246,8 +246,11 @@ fn worker_loop(
         // Skip stale prefetch requests
         let current_gen = generation.load(Ordering::Relaxed);
         if req.generation < current_gen {
+            log::debug!("skip stale request: {}", req.path.display());
             continue;
         }
+
+        let t0 = std::time::Instant::now();
 
         let file_size = std::fs::metadata(&req.path)
             .map(|m| m.len())
@@ -276,6 +279,9 @@ fn worker_loop(
         };
 
         let exif = if image.is_ok() { extract_exif(&data) } else { ExifData::default() };
+
+        log::debug!("decoded {} ({} bytes) in {:.0?}",
+            req.path.display(), file_size, t0.elapsed());
 
         let _ = tx.send(DecodeResult {
             path: req.path,

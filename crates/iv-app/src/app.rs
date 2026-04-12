@@ -144,6 +144,7 @@ impl App {
         // Try the prefetch cache first
         if let Some(ref mut cache) = self.prefetch {
             if let Some(entry) = cache.get(&path) {
+                log::debug!("cache hit: {}", path.display());
                 self.loading = false;
                 let result = DecodeResult {
                     path: path.clone(),
@@ -156,6 +157,7 @@ impl App {
                 return;
             }
             // Cache miss — request background decode
+            log::debug!("cache miss: {}", path.display());
             cache.request(path);
             cache.waiting_for_current = true;
             self.loading = true;
@@ -195,6 +197,7 @@ impl App {
         });
 
         renderer.set_image(&image);
+        log::debug!("loaded {}×{} {}", image.width, image.height, filename);
 
         let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
             .unwrap_or_default();
@@ -254,6 +257,7 @@ impl App {
     }
 
     fn navigate(&mut self, delta: i64) {
+        log::debug!("navigate delta={delta}");
         if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
         if let Some(l) = self.image_list.as_mut() { l.advance(delta); }
@@ -261,6 +265,7 @@ impl App {
     }
 
     fn toggle_mode(&mut self) {
+        log::debug!("toggle display mode");
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.display_mode = renderer.display_mode.next();
             if let Some(w) = &self.window {
@@ -302,6 +307,7 @@ impl App {
     }
 
     fn rotate_image(&mut self, clockwise: bool) {
+        log::debug!("rotate {}", if clockwise { "CW" } else { "CCW" });
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.rotate(clockwise);
             if let Some(w) = &self.window {
@@ -1069,6 +1075,7 @@ impl ApplicationHandler for App {
                             log::warn!("no supported images found");
                             self.loading = false;
                         } else {
+                            log::info!("directory scan complete: {} images", list.len());
                             self.image_list = Some(list);
                             self.load_current();
                         }

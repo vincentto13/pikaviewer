@@ -39,8 +39,56 @@ fn build_registry() -> PluginRegistry {
     r
 }
 
-fn main() -> anyhow::Result<()> {
+fn init_logging() {
+    use std::io::Write;
+
+    if cfg!(debug_assertions) {
+        // Debug builds: log to /tmp/pikaviewer.log at debug level
+        let log_path = std::path::Path::new("/tmp/pikaviewer.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path);
+
+        match file {
+            Ok(file) => {
+                let file = std::sync::Mutex::new(file);
+                env_logger::Builder::new()
+                    .filter_level(log::LevelFilter::Debug)
+                    .filter_module("wgpu", log::LevelFilter::Warn)
+                    .filter_module("naga", log::LevelFilter::Warn)
+                    .format(move |buf, record| {
+                        let ts = buf.timestamp_millis();
+                        let line = format!(
+                            "{ts} [{:5}] {}: {}\n",
+                            record.level(),
+                            record.target(),
+                            record.args()
+                        );
+                        // Write to both stderr and log file
+                        let _ = buf.write_all(line.as_bytes());
+                        if let Ok(mut f) = file.lock() {
+                            let _ = f.write_all(line.as_bytes());
+                            let _ = f.flush();
+                        }
+                        Ok(())
+                    })
+                    .init();
+                log::info!("logging to {}", log_path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("warning: could not open {}: {e}", log_path.display());
+            }
+        }
+    }
+
+    // Release builds (or fallback): stderr only, controlled by RUST_LOG
     env_logger::init();
+}
+
+fn main() -> anyhow::Result<()> {
+    init_logging();
 
     // macOS passes -psn_XXXXXXXX (Process Serial Number) when the app is
     // launched by Finder / Launch Services. Strip it before clap sees it,
