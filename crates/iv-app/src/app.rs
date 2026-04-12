@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::{mpsc, Arc}, time::Instant};
 
 use anyhow::Result;
 use winit::{
@@ -46,6 +46,8 @@ struct ImageInfo {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+type StartupResult = Result<ImageList, String>;
+
 pub struct App {
     pub start_path: Option<PathBuf>,
 
@@ -60,6 +62,7 @@ pub struct App {
     registry:   Arc<PluginRegistry>,
     image_list: Option<ImageList>,
     prefetch:   Option<PrefetchCache>,
+    startup_rx: Option<mpsc::Receiver<StartupResult>>,
     loading:    bool,
 
     egui_ctx:   egui::Context,
@@ -114,6 +117,7 @@ impl App {
             registry,
             image_list: None,
             prefetch:   None,
+            startup_rx: None,
             loading:    false,
             egui_ctx,
             egui_state: None,
@@ -159,44 +163,6 @@ impl App {
             return;
         }
 
-        // Fallback: no prefetch cache (shouldn't happen after resumed)
-        self.load_current_sync();
-    }
-
-    /// Synchronous fallback for load_current (used before prefetch is initialized).
-    fn load_current_sync(&mut self) {
-        let Some(list) = self.image_list.as_ref() else { return };
-        if self.renderer.is_none() { return; }
-
-        let Some(path) = list.current() else { return };
-        let path = path.to_path_buf();
-
-        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) => { log::error!("read {}: {e}", path.display()); return; }
-        };
-
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let plugin = match self.registry.find_for_extension(ext) {
-            Some(p) => p,
-            None => { log::error!("no plugin for '{ext}'"); return; }
-        };
-
-        match plugin.decode(&data) {
-            Ok(image) => {
-                let exif = prefetch::extract_exif(&data);
-                let result = DecodeResult {
-                    path,
-                    image: Ok(image),
-                    exif,
-                    file_size,
-                };
-                self.apply_decode_result(result);
-            }
-            Err(e) => log::error!("decode {}: {e}", path.display()),
-        }
     }
 
     /// Apply a completed decode result: set texture, EXIF rotation, update overlays.
@@ -265,21 +231,26 @@ impl App {
     /// Events when Finder asks us to open a file after the window is up.
     #[cfg(target_os = "macos")]
     fn load_path(&mut self, path: PathBuf) {
-        let result = if path.is_file() {
-            ImageList::from_file(&path, &*self.registry)
-        } else {
-            ImageList::from_directory(&path, &*self.registry)
-        };
-        match result {
-            Ok(list) => {
-                if list.is_empty() { log::warn!("no supported images at {}", path.display()); return; }
-                self.image_list = Some(list);
-                if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
-                if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
-                self.load_current();
-            }
-            Err(e) => log::error!("load_path {}: {e}", path.display()),
-        }
+        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
+        if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
+
+        let registry = Arc::clone(&self.registry);
+        let (tx, rx) = mpsc::channel();
+        self.startup_rx = Some(rx);
+        self.loading = true;
+
+        std::thread::Builder::new()
+            .name("startup-scan".into())
+            .spawn(move || {
+                let path = path.canonicalize().unwrap_or(path);
+                let result = if path.is_file() {
+                    ImageList::from_file(&path, &registry)
+                } else {
+                    ImageList::from_directory(&path, &registry)
+                };
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            })
+            .expect("failed to spawn startup thread");
     }
 
     fn navigate(&mut self, delta: i64) {
@@ -903,19 +874,23 @@ impl ApplicationHandler for App {
         self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry)));
 
         if let Some(path) = self.start_path.clone() {
-            let result = if path.is_file() {
-                ImageList::from_file(&path, &*self.registry)
-            } else {
-                ImageList::from_directory(&path, &*self.registry)
-            };
-            match result {
-                Ok(list) => {
-                    if list.is_empty() { log::warn!("no supported images found"); }
-                    self.image_list = Some(list);
-                    self.load_current();
-                }
-                Err(e) => log::error!("build image list: {e}"),
-            }
+            let registry = Arc::clone(&self.registry);
+            let (tx, rx) = mpsc::channel();
+            self.startup_rx = Some(rx);
+            self.loading = true;
+
+            std::thread::Builder::new()
+                .name("startup-scan".into())
+                .spawn(move || {
+                    let path = path.canonicalize().unwrap_or(path);
+                    let result = if path.is_file() {
+                        ImageList::from_file(&path, &registry)
+                    } else {
+                        ImageList::from_directory(&path, &registry)
+                    };
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                })
+                .expect("failed to spawn startup thread");
         }
     }
 
@@ -1080,6 +1055,29 @@ impl ApplicationHandler for App {
                 .and_then(|mut g| g.take());
             if let Some(path) = path {
                 self.load_path(path);
+            }
+        }
+
+        // Poll startup thread (directory scan on background thread)
+        if self.startup_rx.is_some() {
+            let result = self.startup_rx.as_ref().unwrap().try_recv().ok();
+            if let Some(result) = result {
+                self.startup_rx = None; // one-shot
+                match result {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            log::warn!("no supported images found");
+                            self.loading = false;
+                        } else {
+                            self.image_list = Some(list);
+                            self.load_current();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("build image list: {e}");
+                        self.loading = false;
+                    }
+                }
             }
         }
 

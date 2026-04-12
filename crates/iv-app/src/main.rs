@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let start_path = match cli.path {
-        Some(p) => Some(p.canonicalize().unwrap_or(p)),
+        Some(p) => Some(p),
         None => std::env::current_dir().ok(),
     };
 
