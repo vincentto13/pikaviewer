@@ -218,8 +218,10 @@ impl PrefetchCache {
     }
 
     /// Increment generation counter, causing stale prefetch to be skipped.
+    /// Clears in_flight so new requests for the same paths can be sent.
     pub fn bump_generation(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.clear();
     }
 
     fn evict_if_needed(&mut self) {
