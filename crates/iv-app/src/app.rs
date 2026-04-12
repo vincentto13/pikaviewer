@@ -64,6 +64,7 @@ pub struct App {
     prefetch:   Option<PrefetchCache>,
     startup_rx: Option<mpsc::Receiver<StartupResult>>,
     loading:    bool,
+    empty_folder: bool,
 
     egui_ctx:   egui::Context,
 
@@ -119,6 +120,7 @@ impl App {
             prefetch:   None,
             startup_rx: None,
             loading:    false,
+            empty_folder: false,
             egui_ctx,
             egui_state: None,
             settings,
@@ -158,10 +160,21 @@ impl App {
             }
             // Cache miss — request background decode
             log::debug!("cache miss: {}", path.display());
-            cache.request(path);
+            cache.request(path.clone());
             cache.waiting_for_current = true;
             self.loading = true;
-            if let Some(w) = &self.window { w.request_redraw(); }
+
+            // Update overlay immediately so filename/index reflect the target
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let index = format!("[{}/{}]", list.position(), list.len());
+            self.current_filename = filename.clone();
+            self.current_index = index.clone();
+            if let Some(w) = &self.window {
+                w.set_title(&format!("{APP_NAME} - {filename} {index}"));
+                w.request_redraw();
+            }
             return;
         }
 
@@ -369,11 +382,12 @@ impl App {
         let delete_name    = self.current_filename.clone();
         let show_help      = self.show_help;
         let loading        = self.loading;
+        let empty_folder   = self.empty_folder;
 
         let raw_input   = egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_ui(ctx, &filename, &index, mode_changed, mode_label, show_info, image_info,
-                    pending_delete, &delete_name, show_help, loading);
+                    pending_delete, &delete_name, show_help, loading, empty_folder);
         });
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -445,6 +459,7 @@ fn draw_ui(
     delete_name:    &str,
     show_help:      bool,
     loading:        bool,
+    empty_folder:   bool,
 ) {
     // Use egui's own screen rect — always correct regardless of DPI scaling.
     let win_w = ctx.screen_rect().width();
@@ -620,8 +635,15 @@ fn draw_ui(
             });
     }
 
-    // ── Loading indicator — centred, shown during background decode ──────────
-    if loading {
+    // ── Loading / empty indicator — centred ────────────────────────────────────
+    if empty_folder {
+        egui::Area::new(egui::Id::new("empty_overlay"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                overlay_label(ui, "No images found", 200, 20.0);
+            });
+    } else if loading {
         egui::Area::new(egui::Id::new("loading_overlay"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .interactable(false)
@@ -1074,6 +1096,8 @@ impl ApplicationHandler for App {
                         if list.is_empty() {
                             log::warn!("no supported images found");
                             self.loading = false;
+                            self.empty_folder = true;
+                            if let Some(w) = &self.window { w.request_redraw(); }
                         } else {
                             log::info!("directory scan complete: {} images", list.len());
                             self.image_list = Some(list);
