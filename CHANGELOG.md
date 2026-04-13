@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.0] - 2026-04-13
+
+### Features
+
+- Async prefetch cache — background image decoding with LRU cache (5 entries), N±1 prefetch for instant navigation
+- Deferred startup — window appears immediately, directory scan runs on background thread; app stays responsive on slow/remote drives
+- Loading indicator shown during background decode
+- Filename and index update immediately on navigation, before image finishes loading
+- "No images found" message when opening an empty folder
+- "Folder not found" message when path does not exist
+
+### Fixes
+
+- Fixed stuck "Loading…" when navigating back before prefetch completes (generation bump now clears in-flight set)
+
+### Other
+
+- Debug builds log to `/tmp/pikaviewer.log` at debug level (wgpu/naga silenced)
+- `AppStatus` enum replaces separate loading/empty_folder booleans
+
 ## [0.1.0] - 2026-04-10
 
 Initial release.
