@@ -10,11 +10,24 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
+struct Transform {
+    zoom:  f32,
+    pan_x: f32,
+    pan_y: f32,
+    _pad:  f32,
+};
+
+@group(1) @binding(0) var<uniform> transform: Transform;
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos = vec4<f32>(in.position, 0.0, 1.0);
-    out.uv       = in.uv;
+    out.clip_pos = vec4<f32>(
+        in.position.x * transform.zoom + transform.pan_x,
+        in.position.y * transform.zoom + transform.pan_y,
+        0.0, 1.0
+    );
+    out.uv = in.uv;
     return out;
 }
 
