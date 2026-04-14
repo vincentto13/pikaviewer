@@ -7,7 +7,7 @@ use winit::window::Window;
 
 use iv_core::format::DecodedImage;
 
-use crate::display_mode::{compute_layout, DisplayMode, QuadNdc};
+use crate::display_mode::{compute_window_request, DisplayMode};
 
 /// Shared GPU state that can be used by multiple windows (main + settings).
 pub struct GpuContext {
@@ -37,15 +37,15 @@ impl Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct TransformUniform {
-    zoom:  f32,
-    pan_x: f32,
-    pan_y: f32,
-    _pad:  f32,
+    scale_x:     f32,
+    scale_y:     f32,
+    translate_x: f32,
+    translate_y: f32,
 }
 
 impl TransformUniform {
     fn identity() -> Self {
-        Self { zoom: 1.0, pan_x: 0.0, pan_y: 0.0, _pad: 0.0 }
+        Self { scale_x: 1.0, scale_y: 1.0, translate_x: 0.0, translate_y: 0.0 }
     }
 }
 
@@ -95,7 +95,10 @@ fn premultiply_alpha(pixels: &mut [u8]) {
 
 // ── Vertex layout ─────────────────────────────────────────────────────────────
 
-/// Build 4 vertices (TL, TR, BL, BR) for a TriangleStrip quad.
+/// Build 4 vertices (TL, TR, BL, BR) for a TriangleStrip unit quad.
+///
+/// Positions are always the full NDC quad `(-1,-1)` to `(1,1)`. The transform
+/// uniform (scale + translate) handles letterboxing, zoom, and pan.
 ///
 /// `rotation` is in 90° CW steps (0 = normal, 1 = 90°CW, 2 = 180°, 3 = 270°CW).
 /// UVs are remapped so the correct corner of the source texture lands at each
@@ -106,7 +109,7 @@ fn premultiply_alpha(pixels: &mut [u8]) {
 ///   90°CW:(0,1) (0,0) (1,1) (1,0)  — original BL→screen-TL
 ///   180°: (1,1) (0,1) (1,0) (0,0)
 ///   270°CW(1,0) (1,1) (0,0) (0,1)  — original TR→screen-TL
-fn quad_vertices(q: QuadNdc, rotation: u32) -> [Vertex; 4] {
+fn quad_vertices(rotation: u32) -> [Vertex; 4] {
     let uvs: [[f32; 2]; 4] = match rotation % 4 {
         0 => [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
         1 => [[0.0, 1.0], [0.0, 0.0], [1.0, 1.0], [1.0, 0.0]],
@@ -115,10 +118,10 @@ fn quad_vertices(q: QuadNdc, rotation: u32) -> [Vertex; 4] {
         _ => unreachable!(),
     };
     [
-        Vertex { position: [q.left,  q.top],    uv: uvs[0] },
-        Vertex { position: [q.right, q.top],    uv: uvs[1] },
-        Vertex { position: [q.left,  q.bottom], uv: uvs[2] },
-        Vertex { position: [q.right, q.bottom], uv: uvs[3] },
+        Vertex { position: [-1.0,  1.0], uv: uvs[0] },
+        Vertex { position: [ 1.0,  1.0], uv: uvs[1] },
+        Vertex { position: [-1.0, -1.0], uv: uvs[2] },
+        Vertex { position: [ 1.0, -1.0], uv: uvs[3] },
     ]
 }
 
@@ -129,16 +132,16 @@ pub const ZOOM_MAX: f32 = 8.0;
 
 /// Zoom/pan transform state and its GPU uniform buffer.
 ///
-/// Owns the transform applied in the vertex shader (`position * zoom + pan`).
-/// The `Renderer` keeps this in sync by calling `update_*` methods when the
-/// image, surface size, or quad geometry change.
+/// Owns the single affine transform applied in the vertex shader:
+/// `clip_pos = position * scale + translate`, where scale encodes both the
+/// letterbox fit and zoom, and translate encodes pan.
+///
+/// The `Renderer` keeps this in sync by calling `update_image_size` and
+/// `update_surface_dims` when the image or window size change.
 pub struct Viewport {
     zoom: f32,
     pan:  (f32, f32),
-    /// Cached base quad half-extents (NDC) for pan clamping.
-    quad_half_w: f32,
-    quad_half_h: f32,
-    /// Cached from Renderer — needed for scale/min_zoom computation.
+    /// Effective (rotation-aware) image dimensions, or None if no image loaded.
     image_size:   Option<(u32, u32)>,
     surface_dims: (u32, u32),
     /// GPU uniform buffer + bind group (shader group 1).
@@ -157,8 +160,6 @@ impl Viewport {
         Self {
             zoom: 1.0,
             pan:  (0.0, 0.0),
-            quad_half_w:  0.0,
-            quad_half_h:  0.0,
             image_size:   None,
             surface_dims,
             transform_buf,
@@ -184,15 +185,15 @@ impl Viewport {
     /// Minimum zoom: the level at which the image occupies 5% of its native
     /// pixel dimensions. Capped at 1.0 so it never forces zoom above fit-to-window.
     pub fn min_zoom(&self) -> f32 {
-        let Some(base) = self.base_scale() else { return 1.0 };
-        (0.05 / base).min(1.0)
+        let Some(fs) = self.fit_scale() else { return 1.0 };
+        (0.05 / fs).min(1.0)
     }
 
     /// Current display scale relative to the image's native pixel size.
     /// 1.0 = native, 0.5 = half size, 2.0 = double size.
     pub fn scale(&self) -> f32 {
-        let Some(base) = self.base_scale() else { return 1.0 };
-        self.zoom * base
+        let fs = self.fit_scale().unwrap_or(1.0);
+        self.zoom * fs
     }
 
     /// Bind group for shader group 1 (used by `Renderer::render`).
@@ -237,61 +238,64 @@ impl Viewport {
 
     // ── Update methods (called by Renderer) ───────────────────────────────────
 
-    /// Called after the base quad changes (resize, rotation, new image).
-    /// Re-clamps pan and writes the GPU uniform.
-    pub fn update_quad(&mut self, half_w: f32, half_h: f32) {
-        self.quad_half_w = half_w;
-        self.quad_half_h = half_h;
-        self.clamp_pan();
-        self.write_transform();
-    }
-
     /// Called when the loaded image changes (or is cleared).
+    /// Receives the effective (rotation-aware) image dimensions.
     pub fn update_image_size(&mut self, size: Option<(u32, u32)>) {
         self.image_size = size;
+        self.clamp_pan();
+        self.write_transform();
     }
 
     /// Called when the surface is reconfigured (window resize).
     pub fn update_surface_dims(&mut self, w: u32, h: u32) {
         self.surface_dims = (w, h);
+        self.clamp_pan();
+        self.write_transform();
     }
 
     // ── Private ───────────────────────────────────────────────────────────────
 
-    /// Scale at zoom=1.0: the ratio of displayed pixels to native pixels along
-    /// the constraining axis (the one that fills the window during letterboxing).
-    fn base_scale(&self) -> Option<f32> {
-        let (img_w, img_h) = self.image_size?;
+    /// Scale at zoom=1: the ratio of displayed pixels to native image pixels.
+    /// This is the letterbox fit scale — `min(surface_w/img_w, surface_h/img_h)`.
+    fn fit_scale(&self) -> Option<f32> {
+        let (iw, ih) = self.image_size?;
         let (sw, sh) = self.surface_dims;
-        if img_w == 0 || img_h == 0
-            || self.quad_half_w == 0.0 || self.quad_half_h == 0.0
-            || sw == 0 || sh == 0
-        {
-            return None;
-        }
-        let scale_w = self.quad_half_w * sw as f32 / img_w as f32;
-        let scale_h = self.quad_half_h * sh as f32 / img_h as f32;
-        Some(scale_w.max(scale_h))
+        if iw == 0 || ih == 0 || sw == 0 || sh == 0 { return None; }
+        Some((sw as f32 / iw as f32).min(sh as f32 / ih as f32))
+    }
+
+    /// NDC half-extents of the image quad at the current zoom level.
+    /// Encodes letterbox + zoom into separate X/Y scales.
+    fn ndc_scale(&self) -> (f32, f32) {
+        let Some((iw, ih)) = self.image_size else { return (1.0, 1.0) };
+        let (sw, sh) = self.surface_dims;
+        if iw == 0 || ih == 0 || sw == 0 || sh == 0 { return (1.0, 1.0); }
+        let fs = (sw as f32 / iw as f32).min(sh as f32 / ih as f32);
+        let sx = (iw as f32 * fs / sw as f32) * self.zoom;
+        let sy = (ih as f32 * fs / sh as f32) * self.zoom;
+        (sx, sy)
     }
 
     /// Clamp pan so the image edges never cross the window edges.
     fn clamp_pan(&mut self) {
-        let max_x = (self.quad_half_w * self.zoom - 1.0).max(0.0);
-        let max_y = (self.quad_half_h * self.zoom - 1.0).max(0.0);
+        let (sx, sy) = self.ndc_scale();
+        let max_x = (sx - 1.0).max(0.0);
+        let max_y = (sy - 1.0).max(0.0);
         self.pan.0 = self.pan.0.clamp(-max_x, max_x);
         self.pan.1 = self.pan.1.clamp(-max_y, max_y);
     }
 
-    /// Write zoom/pan state to the GPU uniform buffer.
+    /// Write the combined transform (letterbox + zoom + pan) to the GPU uniform.
     fn write_transform(&self) {
+        let (sx, sy) = self.ndc_scale();
         self.gpu.queue.write_buffer(
             &self.transform_buf,
             0,
             bytemuck::bytes_of(&TransformUniform {
-                zoom:  self.zoom,
-                pan_x: self.pan.0,
-                pan_y: self.pan.1,
-                _pad:  0.0,
+                scale_x:     sx,
+                scale_y:     sy,
+                translate_x: self.pan.0,
+                translate_y: self.pan.1,
             }),
         );
     }
@@ -526,7 +530,7 @@ impl Renderer {
 
     pub fn set_image(&mut self, image: &mut DecodedImage) {
         self.image_size = Some((image.width, image.height));
-        self.viewport.update_image_size(Some((image.width, image.height)));
+        self.viewport.update_image_size(self.effective_image_size());
 
         // Premultiply alpha in linear space for correct sRGB blending.
         premultiply_alpha(&mut image.pixels);
@@ -576,15 +580,10 @@ impl Renderer {
             ],
         });
 
-        let quad = self.current_quad();
-        let half_w = (quad.right - quad.left) / 2.0;
-        let half_h = (quad.top - quad.bottom) / 2.0;
-        self.viewport.update_quad(half_w, half_h);
-
         let vertex_buf = self.gpu.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label:    Some("vertex_buf"),
-                contents: bytemuck::cast_slice(&quad_vertices(quad, self.rotation)),
+                contents: bytemuck::cast_slice(&quad_vertices(self.rotation)),
                 usage:    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             },
         );
@@ -607,7 +606,16 @@ impl Renderer {
         } else {
             (self.rotation + 3) % 4
         };
-        self.refresh_vertex_buf();
+        // Rewrite vertex UVs for the new rotation
+        if let Some(state) = &self.image_state {
+            self.gpu.queue.write_buffer(
+                &state.vertex_buf,
+                0,
+                bytemuck::cast_slice(&quad_vertices(self.rotation)),
+            );
+        }
+        // Effective image dims changed (w↔h swap) — update viewport transform
+        self.viewport.update_image_size(self.effective_image_size());
     }
 
     pub fn resize(&mut self, new_w: u32, new_h: u32) {
@@ -616,21 +624,18 @@ impl Renderer {
         self.config.height = new_h;
         self.surface.configure(&self.gpu.device, &self.config);
         self.viewport.update_surface_dims(new_w, new_h);
-        self.refresh_vertex_buf();
     }
 
     /// Returns the window size to request for the current image + mode.
     /// `None` means don't resize (Fullscreen, or Window+fixed).
     pub fn compute_window_size(&self) -> Option<(u32, u32)> {
         let img = self.effective_image_size()?;
-        compute_layout(
+        compute_window_request(
             self.display_mode,
             img,
-            (self.config.width, self.config.height),
             self.screen_size,
             self.fit_to_image,
         )
-        .request_size
     }
 
     /// Shared GPU context for other windows to reuse.
@@ -713,33 +718,5 @@ impl Renderer {
     fn effective_image_size(&self) -> Option<(u32, u32)> {
         let (w, h) = self.image_size?;
         if self.rotation % 2 == 1 { Some((h, w)) } else { Some((w, h)) }
-    }
-
-    fn current_quad(&self) -> QuadNdc {
-        match self.effective_image_size() {
-            None      => QuadNdc::full_screen(),
-            Some(img) => compute_layout(
-                self.display_mode,
-                img,
-                (self.config.width, self.config.height),
-                self.screen_size,
-                self.fit_to_image,
-            ).quad,
-        }
-    }
-
-    fn refresh_vertex_buf(&mut self) {
-        let quad     = self.current_quad();
-        let rotation = self.rotation;
-        let half_w = (quad.right - quad.left) / 2.0;
-        let half_h = (quad.top - quad.bottom) / 2.0;
-        if let Some(state) = &self.image_state {
-            self.gpu.queue.write_buffer(
-                &state.vertex_buf,
-                0,
-                bytemuck::cast_slice(&quad_vertices(quad, rotation)),
-            );
-        }
-        self.viewport.update_quad(half_w, half_h);
     }
 }

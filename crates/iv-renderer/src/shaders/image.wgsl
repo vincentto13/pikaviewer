@@ -1,4 +1,4 @@
-// Vertex: position in clip space (NDC), UV coords into the image texture.
+// Vertex: unit quad positions scaled by transform, UV coords into the image texture.
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -11,10 +11,10 @@ struct VertexOutput {
 };
 
 struct Transform {
-    zoom:  f32,
-    pan_x: f32,
-    pan_y: f32,
-    _pad:  f32,
+    scale_x:     f32,
+    scale_y:     f32,
+    translate_x: f32,
+    translate_y: f32,
 };
 
 @group(1) @binding(0) var<uniform> transform: Transform;
@@ -23,8 +23,8 @@ struct Transform {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_pos = vec4<f32>(
-        in.position.x * transform.zoom + transform.pan_x,
-        in.position.y * transform.zoom + transform.pan_y,
+        in.position.x * transform.scale_x + transform.translate_x,
+        in.position.y * transform.scale_y + transform.translate_y,
         0.0, 1.0
     );
     out.uv = in.uv;
