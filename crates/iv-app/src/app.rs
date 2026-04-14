@@ -280,7 +280,7 @@ impl App {
 
     fn navigate(&mut self, delta: i64) {
         log::debug!("navigate delta={delta}");
-        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.reset_zoom(); }
+        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
         if let Some(l) = self.image_list.as_mut() { l.advance(delta); }
         self.load_current();
@@ -289,7 +289,7 @@ impl App {
     fn toggle_mode(&mut self) {
         log::debug!("toggle display mode");
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_zoom();
+            renderer.viewport.reset_zoom();
             renderer.display_mode = renderer.display_mode.next();
             if let Some(w) = &self.window {
                 match renderer.display_mode {
@@ -308,16 +308,14 @@ impl App {
 
     fn zoom_in(&mut self) {
         if let Some(r) = self.renderer.as_mut() {
-            let z = (r.zoom * ZOOM_STEP).min(iv_renderer::ZOOM_MAX);
-            r.set_zoom(z);
+            r.viewport.zoom_in(ZOOM_STEP);
         }
         if let Some(w) = &self.window { w.request_redraw(); }
     }
 
     fn zoom_out(&mut self) {
         if let Some(r) = self.renderer.as_mut() {
-            let z = r.zoom / ZOOM_STEP;
-            r.set_zoom(z);
+            r.viewport.zoom_out(ZOOM_STEP);
         }
         if let Some(w) = &self.window { w.request_redraw(); }
     }
@@ -348,7 +346,7 @@ impl App {
     fn rotate_image(&mut self, clockwise: bool) {
         log::debug!("rotate {}", if clockwise { "CW" } else { "CCW" });
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_zoom();
+            renderer.viewport.reset_zoom();
             renderer.rotate(clockwise);
             if let Some(w) = &self.window {
                 if let Some((nw, nh)) = renderer.compute_window_size() {
@@ -400,7 +398,7 @@ impl App {
         // with egui_ctx.run() which takes &mut self implicitly via the closure.
         let filename     = self.current_filename.clone();
         let index        = self.current_index.clone();
-        let scale_pct    = renderer.image_size.map(|_| (renderer.scale() * 100.0).round().max(1.0) as u32);
+        let scale_pct    = renderer.image_size.map(|_| (renderer.viewport.scale() * 100.0).round().max(1.0) as u32);
         let mode_changed = self.mode_changed_at;
         let mode_label   = renderer.display_mode.label();
         let show_info    = self.show_info;
@@ -1056,36 +1054,36 @@ impl ApplicationHandler for App {
                 // Snapshot before match — may go stale if an arm mutates the
                 // renderer (e.g. navigate → reset_zoom), but no arm reads these
                 // values after such a mutation.
-                let is_zoomed = self.renderer.as_ref().map(|r| r.is_zoomed()).unwrap_or(false);
-                let zoom      = self.renderer.as_ref().map(|r| r.zoom).unwrap_or(1.0);
+                let is_zoomed = self.renderer.as_ref().map(|r| r.viewport.is_zoomed()).unwrap_or(false);
+                let zoom      = self.renderer.as_ref().map(|r| r.viewport.zoom()).unwrap_or(1.0);
                 match logical_key {
                 Key::Named(NamedKey::ArrowRight) => {
                     if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(-(PAN_STEP / zoom), 0.0); }
+                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(-(PAN_STEP / zoom), 0.0); }
                         if let Some(w) = &self.window { w.request_redraw(); }
                     } else { self.navigate(1); }
                 }
                 Key::Named(NamedKey::ArrowDown) => {
                     if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(0.0, PAN_STEP / zoom); }
+                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(0.0, PAN_STEP / zoom); }
                         if let Some(w) = &self.window { w.request_redraw(); }
                     } else { self.navigate(1); }
                 }
                 Key::Named(NamedKey::ArrowLeft) => {
                     if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(PAN_STEP / zoom, 0.0); }
+                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(PAN_STEP / zoom, 0.0); }
                         if let Some(w) = &self.window { w.request_redraw(); }
                     } else { self.navigate(-1); }
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(0.0, -(PAN_STEP / zoom)); }
+                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(0.0, -(PAN_STEP / zoom)); }
                         if let Some(w) = &self.window { w.request_redraw(); }
                     } else { self.navigate(-1); }
                 }
                 Key::Named(NamedKey::Space) => {
                     if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.reset_zoom(); }
+                        if let Some(r) = self.renderer.as_mut() { r.viewport.reset_zoom(); }
                         if let Some(w) = &self.window { w.request_redraw(); }
                     } else if self.modifiers.shift_key() {
                         self.navigate(-1);

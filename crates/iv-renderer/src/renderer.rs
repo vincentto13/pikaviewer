@@ -122,25 +122,196 @@ fn quad_vertices(q: QuadNdc, rotation: u32) -> [Vertex; 4] {
     ]
 }
 
-// ── Renderer ──────────────────────────────────────────────────────────────────
+// ── Viewport ─────────────────────────────────────────────────────────────────
 
 /// Maximum zoom factor (8× the fit-to-window size).
 pub const ZOOM_MAX: f32 = 8.0;
 
+/// Zoom/pan transform state and its GPU uniform buffer.
+///
+/// Owns the transform applied in the vertex shader (`position * zoom + pan`).
+/// The `Renderer` keeps this in sync by calling `update_*` methods when the
+/// image, surface size, or quad geometry change.
+pub struct Viewport {
+    zoom: f32,
+    pan:  (f32, f32),
+    /// Cached base quad half-extents (NDC) for pan clamping.
+    quad_half_w: f32,
+    quad_half_h: f32,
+    /// Cached from Renderer — needed for scale/min_zoom computation.
+    image_size:   Option<(u32, u32)>,
+    surface_dims: (u32, u32),
+    /// GPU uniform buffer + bind group (shader group 1).
+    transform_buf:        wgpu::Buffer,
+    transform_bind_group: wgpu::BindGroup,
+    gpu: Arc<GpuContext>,
+}
+
+impl Viewport {
+    fn new(
+        gpu: Arc<GpuContext>,
+        transform_buf: wgpu::Buffer,
+        transform_bind_group: wgpu::BindGroup,
+        surface_dims: (u32, u32),
+    ) -> Self {
+        Self {
+            zoom: 1.0,
+            pan:  (0.0, 0.0),
+            quad_half_w:  0.0,
+            quad_half_h:  0.0,
+            image_size:   None,
+            surface_dims,
+            transform_buf,
+            transform_bind_group,
+            gpu,
+        }
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Returns true when zoom is active (> 1.0), meaning the image overflows
+    /// the window and arrow keys should pan rather than navigate.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom > 1.0
+    }
+
+    /// Current zoom level (read-only). Prefer intent methods (`zoom_in`,
+    /// `set_zoom`, etc.) over reading this and computing externally.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Minimum zoom: the level at which the image occupies 5% of its native
+    /// pixel dimensions. Capped at 1.0 so it never forces zoom above fit-to-window.
+    pub fn min_zoom(&self) -> f32 {
+        let Some(base) = self.base_scale() else { return 1.0 };
+        (0.05 / base).min(1.0)
+    }
+
+    /// Current display scale relative to the image's native pixel size.
+    /// 1.0 = native, 0.5 = half size, 2.0 = double size.
+    pub fn scale(&self) -> f32 {
+        let Some(base) = self.base_scale() else { return 1.0 };
+        self.zoom * base
+    }
+
+    /// Bind group for shader group 1 (used by `Renderer::render`).
+    pub fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.transform_bind_group
+    }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
+
+    /// Set zoom level, clamped to [min_zoom(), ZOOM_MAX]. Pan is re-clamped to
+    /// the new bounds, keeping the image corner at the window corner on zoom-out.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom.clamp(self.min_zoom(), ZOOM_MAX);
+        self.clamp_pan();
+        self.write_transform();
+    }
+
+    /// Zoom in by one multiplicative step (e.g. `step = 1.25`).
+    pub fn zoom_in(&mut self, step: f32) {
+        self.set_zoom(self.zoom * step);
+    }
+
+    /// Zoom out by one multiplicative step (e.g. `step = 1.25`).
+    pub fn zoom_out(&mut self, step: f32) {
+        self.set_zoom(self.zoom / step);
+    }
+
+    /// Adjust pan by (dx, dy) in NDC, clamped so the image doesn't leave the screen.
+    pub fn adjust_pan(&mut self, dx: f32, dy: f32) {
+        self.pan.0 += dx;
+        self.pan.1 += dy;
+        self.clamp_pan();
+        self.write_transform();
+    }
+
+    /// Reset zoom to 1.0 and pan to (0, 0).
+    pub fn reset_zoom(&mut self) {
+        self.zoom = 1.0;
+        self.pan  = (0.0, 0.0);
+        self.write_transform();
+    }
+
+    // ── Update methods (called by Renderer) ───────────────────────────────────
+
+    /// Called after the base quad changes (resize, rotation, new image).
+    /// Re-clamps pan and writes the GPU uniform.
+    pub fn update_quad(&mut self, half_w: f32, half_h: f32) {
+        self.quad_half_w = half_w;
+        self.quad_half_h = half_h;
+        self.clamp_pan();
+        self.write_transform();
+    }
+
+    /// Called when the loaded image changes (or is cleared).
+    pub fn update_image_size(&mut self, size: Option<(u32, u32)>) {
+        self.image_size = size;
+    }
+
+    /// Called when the surface is reconfigured (window resize).
+    pub fn update_surface_dims(&mut self, w: u32, h: u32) {
+        self.surface_dims = (w, h);
+    }
+
+    // ── Private ───────────────────────────────────────────────────────────────
+
+    /// Scale at zoom=1.0: the ratio of displayed pixels to native pixels along
+    /// the constraining axis (the one that fills the window during letterboxing).
+    fn base_scale(&self) -> Option<f32> {
+        let (img_w, img_h) = self.image_size?;
+        let (sw, sh) = self.surface_dims;
+        if img_w == 0 || img_h == 0
+            || self.quad_half_w == 0.0 || self.quad_half_h == 0.0
+            || sw == 0 || sh == 0
+        {
+            return None;
+        }
+        let scale_w = self.quad_half_w * sw as f32 / img_w as f32;
+        let scale_h = self.quad_half_h * sh as f32 / img_h as f32;
+        Some(scale_w.max(scale_h))
+    }
+
+    /// Clamp pan so the image edges never cross the window edges.
+    fn clamp_pan(&mut self) {
+        let max_x = (self.quad_half_w * self.zoom - 1.0).max(0.0);
+        let max_y = (self.quad_half_h * self.zoom - 1.0).max(0.0);
+        self.pan.0 = self.pan.0.clamp(-max_x, max_x);
+        self.pan.1 = self.pan.1.clamp(-max_y, max_y);
+    }
+
+    /// Write zoom/pan state to the GPU uniform buffer.
+    fn write_transform(&self) {
+        self.gpu.queue.write_buffer(
+            &self.transform_buf,
+            0,
+            bytemuck::bytes_of(&TransformUniform {
+                zoom:  self.zoom,
+                pan_x: self.pan.0,
+                pan_y: self.pan.1,
+                _pad:  0.0,
+            }),
+        );
+    }
+}
+
+// ── Renderer ──────────────────────────────────────────────────────────────────
+
 pub struct Renderer {
     // Drop order: GPU resources must drop before `gpu` (Device/Queue).
     // Rust drops fields in declaration order.
-    image_state:                 Option<ImageState>,
-    egui_renderer:               egui_wgpu::Renderer,
-    pipeline:                    wgpu::RenderPipeline,
+    image_state:    Option<ImageState>,
+    egui_renderer:  egui_wgpu::Renderer,
+    pipeline:       wgpu::RenderPipeline,
     bind_group_layout:           wgpu::BindGroupLayout,
     #[allow(dead_code)]
     transform_bind_group_layout: wgpu::BindGroupLayout,
-    transform_buf:               wgpu::Buffer,
-    transform_bind_group:        wgpu::BindGroup,
-    surface:                     wgpu::Surface<'static>,
-    config:                      wgpu::SurfaceConfiguration,
-    gpu:                         Arc<GpuContext>,
+    pub viewport:   Viewport,
+    surface:        wgpu::Surface<'static>,
+    config:         wgpu::SurfaceConfiguration,
+    gpu:            Arc<GpuContext>,
 
     pub display_mode:  DisplayMode,
     pub fit_to_image:  bool,
@@ -148,14 +319,6 @@ pub struct Renderer {
     /// 0 = 0°, 1 = 90°CW, 2 = 180°, 3 = 270°CW
     pub rotation:      u32,
     screen_size:       (u32, u32),
-
-    /// Current zoom factor. 1.0 = image fitted to window (default).
-    pub zoom:          f32,
-    /// Pan offset in NDC. (0, 0) = centered.
-    pub pan:           (f32, f32),
-    /// Cached base quad half-extents (NDC) for pan clamping.
-    quad_half_w:       f32,
-    quad_half_h:       f32,
 }
 
 struct ImageState {
@@ -242,7 +405,7 @@ impl Renderer {
             },
         );
 
-        // ── Transform uniform bind group layout (group 1) ─────────────────────
+        // ── Transform uniform (group 1) — owned by Viewport ──────────────────
 
         let transform_bind_group_layout = gpu.device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
@@ -276,6 +439,13 @@ impl Renderer {
                 resource: transform_buf.as_entire_binding(),
             }],
         });
+
+        let viewport = Viewport::new(
+            gpu.clone(),
+            transform_buf,
+            transform_bind_group,
+            (config.width, config.height),
+        );
 
         // ── Image render pipeline ─────────────────────────────────────────────
 
@@ -340,8 +510,7 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             transform_bind_group_layout,
-            transform_buf,
-            transform_bind_group,
+            viewport,
             egui_renderer,
             image_state:    None,
             display_mode:   DisplayMode::Window,
@@ -349,10 +518,6 @@ impl Renderer {
             image_size:     None,
             rotation:       0,
             screen_size,
-            zoom:           1.0,
-            pan:            (0.0, 0.0),
-            quad_half_w:    0.0,
-            quad_half_h:    0.0,
         };
         Ok((renderer, gpu))
     }
@@ -361,6 +526,7 @@ impl Renderer {
 
     pub fn set_image(&mut self, image: &mut DecodedImage) {
         self.image_size = Some((image.width, image.height));
+        self.viewport.update_image_size(Some((image.width, image.height)));
 
         // Premultiply alpha in linear space for correct sRGB blending.
         premultiply_alpha(&mut image.pixels);
@@ -411,8 +577,9 @@ impl Renderer {
         });
 
         let quad = self.current_quad();
-        self.quad_half_w = (quad.right - quad.left) / 2.0;
-        self.quad_half_h = (quad.top - quad.bottom) / 2.0;
+        let half_w = (quad.right - quad.left) / 2.0;
+        let half_h = (quad.top - quad.bottom) / 2.0;
+        self.viewport.update_quad(half_w, half_h);
 
         let vertex_buf = self.gpu.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -430,86 +597,7 @@ impl Renderer {
         self.image_state = None;
         self.image_size  = None;
         self.rotation    = 0;
-    }
-
-    /// Returns true when zoom is active (> 1.0), meaning the image overflows
-    /// the window and arrow keys should pan rather than navigate.
-    pub fn is_zoomed(&self) -> bool {
-        self.zoom > 1.0
-    }
-
-    /// Scale at zoom=1.0: the ratio of displayed pixels to native pixels along
-    /// the constraining axis (the one that fills the window during letterboxing).
-    fn base_scale(&self) -> Option<f32> {
-        let (img_w, img_h) = self.image_size?;
-        if img_w == 0 || img_h == 0
-            || self.quad_half_w == 0.0 || self.quad_half_h == 0.0
-            || self.config.width == 0 || self.config.height == 0
-        {
-            return None;
-        }
-        let scale_w = self.quad_half_w * self.config.width as f32 / img_w as f32;
-        let scale_h = self.quad_half_h * self.config.height as f32 / img_h as f32;
-        Some(scale_w.max(scale_h))
-    }
-
-    /// Minimum zoom: the level at which the image occupies 5% of its native
-    /// pixel dimensions. Capped at 1.0 so it never forces zoom above fit-to-window.
-    pub fn min_zoom(&self) -> f32 {
-        let Some(base) = self.base_scale() else { return 1.0 };
-        (0.05 / base).min(1.0)
-    }
-
-    /// Current display scale relative to the image's native pixel size.
-    /// 1.0 = native, 0.5 = half size, 2.0 = double size.
-    pub fn scale(&self) -> f32 {
-        let Some(base) = self.base_scale() else { return 1.0 };
-        self.zoom * base
-    }
-
-    /// Set zoom level, clamped to [min_zoom(), ZOOM_MAX]. Pan is re-clamped to
-    /// the new bounds, keeping the image corner at the window corner on zoom-out.
-    pub fn set_zoom(&mut self, zoom: f32) {
-        self.zoom = zoom.clamp(self.min_zoom(), ZOOM_MAX);
-        self.clamp_pan();
-        self.write_transform();
-    }
-
-    /// Adjust pan by (dx, dy) in NDC, clamped so the image doesn't leave the screen.
-    pub fn adjust_pan(&mut self, dx: f32, dy: f32) {
-        self.pan.0 += dx;
-        self.pan.1 += dy;
-        self.clamp_pan();
-        self.write_transform();
-    }
-
-    /// Reset zoom to 1.0 and pan to (0, 0).
-    pub fn reset_zoom(&mut self) {
-        self.zoom = 1.0;
-        self.pan  = (0.0, 0.0);
-        self.write_transform();
-    }
-
-    /// Clamp pan so the image edges never cross the window edges.
-    fn clamp_pan(&mut self) {
-        let max_x = (self.quad_half_w * self.zoom - 1.0).max(0.0);
-        let max_y = (self.quad_half_h * self.zoom - 1.0).max(0.0);
-        self.pan.0 = self.pan.0.clamp(-max_x, max_x);
-        self.pan.1 = self.pan.1.clamp(-max_y, max_y);
-    }
-
-    /// Write zoom/pan state to the GPU uniform buffer.
-    fn write_transform(&self) {
-        self.gpu.queue.write_buffer(
-            &self.transform_buf,
-            0,
-            bytemuck::bytes_of(&TransformUniform {
-                zoom:  self.zoom,
-                pan_x: self.pan.0,
-                pan_y: self.pan.1,
-                _pad:  0.0,
-            }),
-        );
+        self.viewport.update_image_size(None);
     }
 
     /// Rotate by one 90° step. `clockwise = true` → +90°CW.
@@ -527,6 +615,7 @@ impl Renderer {
         self.config.width  = new_w;
         self.config.height = new_h;
         self.surface.configure(&self.gpu.device, &self.config);
+        self.viewport.update_surface_dims(new_w, new_h);
         self.refresh_vertex_buf();
     }
 
@@ -604,7 +693,7 @@ impl Renderer {
             if let Some(state) = &self.image_state {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &state.bind_group, &[]);
-                pass.set_bind_group(1, &self.transform_bind_group, &[]);
+                pass.set_bind_group(1, self.viewport.bind_group(), &[]);
                 pass.set_vertex_buffer(0, state.vertex_buf.slice(..));
                 pass.draw(0..4, 0..1);
             }
@@ -642,8 +731,8 @@ impl Renderer {
     fn refresh_vertex_buf(&mut self) {
         let quad     = self.current_quad();
         let rotation = self.rotation;
-        self.quad_half_w = (quad.right - quad.left) / 2.0;
-        self.quad_half_h = (quad.top - quad.bottom) / 2.0;
+        let half_w = (quad.right - quad.left) / 2.0;
+        let half_h = (quad.top - quad.bottom) / 2.0;
         if let Some(state) = &self.image_state {
             self.gpu.queue.write_buffer(
                 &state.vertex_buf,
@@ -651,8 +740,6 @@ impl Renderer {
                 bytemuck::cast_slice(&quad_vertices(quad, rotation)),
             );
         }
-        // Re-clamp pan so corners stay flush with window edges after resize/rotation.
-        self.clamp_pan();
-        self.write_transform();
+        self.viewport.update_quad(half_w, half_h);
     }
 }
