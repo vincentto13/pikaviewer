@@ -33,6 +33,10 @@ const FONT_INFO:     f32 = 14.0;
 const MIN_WINDOW_W: u32 = 600;
 const MIN_WINDOW_H: u32 = 450;
 
+// Zoom / pan
+const ZOOM_STEP: f32 = 1.25;   // multiply / divide per keypress
+const PAN_STEP:  f32 = 0.1;    // NDC per press (divided by zoom → constant pixel movement)
+
 // ── Image info ───────────────────────────────────────────────────────────────
 
 /// Metadata about the currently loaded image, shown in the info panel.
@@ -276,7 +280,7 @@ impl App {
 
     fn navigate(&mut self, delta: i64) {
         log::debug!("navigate delta={delta}");
-        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
+        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.reset_zoom(); }
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
         if let Some(l) = self.image_list.as_mut() { l.advance(delta); }
         self.load_current();
@@ -285,6 +289,7 @@ impl App {
     fn toggle_mode(&mut self) {
         log::debug!("toggle display mode");
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.reset_zoom();
             renderer.display_mode = renderer.display_mode.next();
             if let Some(w) = &self.window {
                 match renderer.display_mode {
@@ -299,6 +304,22 @@ impl App {
         }
         self.mode_changed_at = Some(Instant::now());
         self.load_current();
+    }
+
+    fn zoom_in(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            let z = (r.zoom * ZOOM_STEP).min(iv_renderer::ZOOM_MAX);
+            r.set_zoom(z);
+        }
+        if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    fn zoom_out(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            let z = r.zoom / ZOOM_STEP;
+            r.set_zoom(z);
+        }
+        if let Some(w) = &self.window { w.request_redraw(); }
     }
 
     fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
@@ -327,6 +348,7 @@ impl App {
     fn rotate_image(&mut self, clockwise: bool) {
         log::debug!("rotate {}", if clockwise { "CW" } else { "CCW" });
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.reset_zoom();
             renderer.rotate(clockwise);
             if let Some(w) = &self.window {
                 if let Some((nw, nh)) = renderer.compute_window_size() {
@@ -378,6 +400,7 @@ impl App {
         // with egui_ctx.run() which takes &mut self implicitly via the closure.
         let filename     = self.current_filename.clone();
         let index        = self.current_index.clone();
+        let scale_pct    = renderer.image_size.map(|_| (renderer.scale() * 100.0).round().max(1.0) as u32);
         let mode_changed = self.mode_changed_at;
         let mode_label   = renderer.display_mode.label();
         let show_info    = self.show_info;
@@ -390,8 +413,8 @@ impl App {
 
         let raw_input   = egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, &filename, &index, mode_changed, mode_label, show_info, image_info,
-                    pending_delete, &delete_name, show_help, status);
+            draw_ui(ctx, &filename, &index, scale_pct, mode_changed, mode_label, show_info,
+                    image_info, pending_delete, &delete_name, show_help, status);
         });
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -455,6 +478,7 @@ fn draw_ui(
     ctx:            &egui::Context,
     filename:       &str,
     index:          &str,
+    scale_pct:      Option<u32>,
     mode_changed:   Option<Instant>,
     mode_label:     &str,
     show_info:      bool,
@@ -477,9 +501,10 @@ fn draw_ui(
     if !filename.is_empty() {
         let font_id = egui::FontId::proportional(FONT_FILENAME);
 
-        // Reserve pixels for the index suffix " [pos/total]", fit the rest
-        // with the filename (truncating from the right with … before extension).
-        let index_suffix = format!("  {index}");
+        // Reserve pixels for the index + scale suffix " [pos/total] 58%", fit
+        // the rest with the filename (truncating from the right with … before extension).
+        let scale_str = scale_pct.map(|p| format!(" {p}%")).unwrap_or_default();
+        let index_suffix = format!("  {index}{scale_str}");
         let index_w = ctx.fonts(|f| {
             f.layout_no_wrap(index_suffix.clone(), font_id.clone(), egui::Color32::WHITE)
                 .size().x
@@ -590,8 +615,14 @@ fn draw_ui(
                 // (keys, separator, description)
                 // "/" = alternatives, "+" = combo
                 let shortcuts: &[(&[&str], &str, &str)] = &[
-                    (&["Right", "Down", "Space", "."],  "/", "Next image"),
-                    (&["Left", "Up", "Shift+Space", ","], "/", "Previous image"),
+                    (&["Right", "Down"],                "/", "Next image (pan right/down when zoomed)"),
+                    (&["Left", "Up"],                   "/", "Prev image (pan left/up when zoomed)"),
+                    (&["."],                            "/", "Next image"),
+                    (&[","],                            "/", "Previous image"),
+                    (&["Space"],                        "/", "Next image / reset zoom when zoomed"),
+                    (&["Shift+Space"],                  "/", "Prev image / reset zoom when zoomed"),
+                    (&["+", "="],                       "/", "Zoom in"),
+                    (&["-"],                            "/", "Zoom out / reset"),
                     (&["M"],                            "/", "Cycle display mode"),
                     (&["R", "]"],                       "/", "Rotate 90\u{00b0} clockwise"),
                     (&["L", "["],                       "/", "Rotate 90\u{00b0} counter-clockwise"),
@@ -1021,15 +1052,42 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
-            } => match logical_key {
-                Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowDown) => {
-                    self.navigate(1);
+            } => {
+                // Snapshot before match — may go stale if an arm mutates the
+                // renderer (e.g. navigate → reset_zoom), but no arm reads these
+                // values after such a mutation.
+                let is_zoomed = self.renderer.as_ref().map(|r| r.is_zoomed()).unwrap_or(false);
+                let zoom      = self.renderer.as_ref().map(|r| r.zoom).unwrap_or(1.0);
+                match logical_key {
+                Key::Named(NamedKey::ArrowRight) => {
+                    if is_zoomed {
+                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(-(PAN_STEP / zoom), 0.0); }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    } else { self.navigate(1); }
                 }
-                Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowUp) => {
-                    self.navigate(-1);
+                Key::Named(NamedKey::ArrowDown) => {
+                    if is_zoomed {
+                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(0.0, PAN_STEP / zoom); }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    } else { self.navigate(1); }
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    if is_zoomed {
+                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(PAN_STEP / zoom, 0.0); }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    } else { self.navigate(-1); }
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if is_zoomed {
+                        if let Some(r) = self.renderer.as_mut() { r.adjust_pan(0.0, -(PAN_STEP / zoom)); }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    } else { self.navigate(-1); }
                 }
                 Key::Named(NamedKey::Space) => {
-                    if self.modifiers.shift_key() {
+                    if is_zoomed {
+                        if let Some(r) = self.renderer.as_mut() { r.reset_zoom(); }
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                    } else if self.modifiers.shift_key() {
                         self.navigate(-1);
                     } else {
                         self.navigate(1);
@@ -1069,9 +1127,12 @@ impl ApplicationHandler for App {
                     }
                     "]"       => self.rotate_image(true),
                     "["       => self.rotate_image(false),
+                    "+" | "=" => self.zoom_in(),
+                    "-"        => self.zoom_out(),
                     _ => {}
                 },
                 _ => {}
+                } // match logical_key
             },
 
             _ => {}
@@ -1099,7 +1160,6 @@ impl ApplicationHandler for App {
                     Ok(list) => {
                         if list.is_empty() {
                             log::warn!("no supported images found");
-                            self.status = AppStatus::Ready;
                             self.status = AppStatus::EmptyFolder;
                             if let Some(w) = &self.window { w.request_redraw(); }
                         } else {
