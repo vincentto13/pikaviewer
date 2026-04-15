@@ -10,8 +10,11 @@ A cross-platform image viewer built in Rust. Target platforms: **Linux** (built 
 |---|---|---|
 | Window + events | `winit 0.30` | Cross-platform windowing, keyboard input |
 | GPU rendering | `wgpu 22` | Vulkan/Metal/DX12 backend, image as textured quad |
-| UI overlay | `egui 0.29` + `egui-wgpu 0.29` + `egui-winit 0.29` | Filename/mode overlays |
-| Image decoding | `image 0.25` | JPEG, PNG, GIF, BMP, TIFF, WebP, ICO |
+| UI overlay | `egui 0.29` + `egui-wgpu 0.29` + `egui-winit 0.29` | Filename/mode overlays, settings window |
+| Image decoding | `image 0.25` | JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, QOI |
+| HEIC/AVIF | `libheif-rs 1` (optional) | HEIC, HEIF, AVIF via system libheif |
+| EXIF | `kamadak-exif 0.5` | Orientation auto-rotation, camera/lens/exposure metadata |
+| Config | `serde` + `toml` + `dirs` | TOML settings at OS-appropriate config path |
 | App entry | `clap 4` | CLI arg parsing |
 | Blocking async | `pollster` | `block_on` for wgpu adapter init |
 
@@ -19,10 +22,11 @@ A cross-platform image viewer built in Rust. Target platforms: **Linux** (built 
 
 ```
 crates/
-  iv-core/        # FormatPlugin trait, PluginRegistry, ImageList — zero UI deps
-  iv-formats/     # image-rs plugin (wraps the `image` crate)
-  iv-renderer/    # wgpu renderer, display mode logic, WGSL shader, egui-wgpu
-  iv-app/         # main binary: winit event loop, App struct, egui overlays
+  iv-core/          # FormatPlugin trait, PluginRegistry, ImageList, premultiplied alpha — zero UI deps
+  iv-formats/       # image-rs plugin (wraps the `image` crate)
+  iv-format-heic/   # libheif plugin — NOT a workspace member (only compiled with --features iv-app/heic)
+  iv-renderer/      # wgpu renderer, Viewport (zoom/pan), display modes, WGSL shader, egui-wgpu
+  iv-app/           # main binary: winit event loop, App struct, egui overlays, prefetch cache, settings
 ```
 
 ## Key abstractions
@@ -30,40 +34,70 @@ crates/
 **`FormatPlugin` trait** (`iv-core/src/format.rs`): extension point for new image formats.
 - Implement `descriptor()` → extensions list
 - Implement `decode(&[u8]) → Result<DecodedImage, FormatError>`
+- `DecodedImage` includes `has_alpha: bool` for premultiplied alpha optimization
 - Register with `PluginRegistry::register()`
-- Future RAW (NEF) and HEIC support = new crates implementing this trait
 
 **`ImageList`** (`iv-core/src/image_list.rs`): scans a directory, sorts alphabetically, wraps on advance.
+- `peek_offset(delta)` — peek without moving cursor (used by prefetch)
+- `remove_current()` — for file deletion
 
 **`DisplayMode`** (`iv-renderer/src/display_mode.rs`):
-- `Regular` — window resizes to image native size; capped at screen; never smaller than 600×450; position clamped to screen; image letterboxed into actual window (not requested size)
+- `Window` — behavior depends on `fit_to_image` setting:
+  - `fit_to_image=true`: window resizes to image (capped at screen)
+  - `fit_to_image=false`: window stays at fixed user-chosen size, image letterboxed
 - `Fullscreen` — OS borderless fullscreen, image letterboxed
-- `FixedSize { w, h }` — window fixed at 1280×720, image letterboxed
 - Toggle with `M` key; mode name shown in overlay for 5 s then fades
+
+**`Viewport`** (`iv-renderer/src/renderer.rs`): zoom/pan state for the image quad.
+- Zoom via `+`/`-` keys (multiplicative steps, clamped to `[min_zoom, ZOOM_MAX]`)
+- Pan via arrow keys when zoomed in
+- Transform uniform uploaded to GPU via bind group
 
 **`Renderer`** (`iv-renderer/src/renderer.rs`): owns wgpu device/queue/surface + egui-wgpu renderer.
 - `set_image()` — uploads RGBA8 texture, rebuilds vertex buffer
 - `rotate(clockwise)` — remaps UV coords in vertex buffer (no shader change); swaps dims for letterbox on 90°/270°
 - `render(paint_jobs, tex_delta, screen_desc)` — draws image quad then egui overlay
 - `resize(w, h)` — reconfigures surface and refreshes vertex buffer
+- `GpuContext` — shared `Instance`/`Adapter`/`Device`/`Queue` (Arc'd for multi-window)
+
+**`PrefetchCache`** (`iv-app/src/prefetch.rs`): async background image decoding.
+- Worker thread pool decodes N+1/N-1 images ahead
+- LRU eviction (5 entries)
+- Uses `EventLoopProxy` to wake main thread on completion (no polling)
+- Extracts EXIF data during decode (orientation, camera metadata)
+- `Arc<DecodedImage>` for zero-copy cache sharing
 
 **`App`** (`iv-app/src/app.rs`): implements `winit::application::ApplicationHandler`.
 Owns `egui::Context` + `egui_winit::State`. Pre-extracts overlay data before `egui_ctx.run()` to avoid borrow conflicts.
-- `clamped_size(window, w, h)` — converts `MIN_WINDOW_W/H` to physical px via scale factor and applies `.max()`; used before every `request_inner_size` call
-- `render_frame` checks `viewport_output.repaint_delay == Duration::ZERO` to schedule immediate winit redraws when egui requests them
+- `clamped_size(window, w, h)` — converts `MIN_WINDOW_W/H` to physical px via scale factor
+- `render_frame` checks `viewport_output.repaint_delay == Duration::ZERO` to schedule immediate winit redraws
+- Registry built in `main::build_registry()` with feature-gated plugins
+- Settings saved on exit (not on every resize)
+
+**`SettingsWindow`** (`iv-app/src/settings_window.rs`): separate winit window with its own wgpu surface.
+- Shares `Arc<GpuContext>` with main window
+- egui checkbox for `fit_to_image` setting
+- `Ctrl/Cmd + ,` shortcut to open
 
 ## Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| `→` / `↓` / `Space` / `.` | Next image |
-| `←` / `↑` / `Shift+Space` / `,` | Previous image |
-| `M` | Cycle display mode (Regular → Fullscreen → Fixed 1280×720) |
+| `→` / `↓` | Next image (pan right/down when zoomed) |
+| `←` / `↑` | Previous image (pan left/up when zoomed) |
+| `Space` | Next image / reset zoom when zoomed |
+| `Shift+Space` | Previous image / reset zoom when zoomed |
+| `.` | Next image |
+| `,` | Previous image |
+| `+` / `=` | Zoom in |
+| `-` | Zoom out / reset |
+| `M` | Cycle display mode (Window / Fullscreen) |
 | `R` / `]` | Rotate 90° clockwise (resets on next image) |
 | `L` / `[` | Rotate 90° counter-clockwise (resets on next image) |
 | `I` | Toggle image info panel |
 | `D` | Delete current image (with confirmation) |
 | `H` | Show keyboard shortcuts help |
+| `Ctrl/Cmd + ,` | Open settings |
 | `Cmd/Ctrl + W` | Close window |
 | `Q` / `Escape` | Quit |
 
@@ -73,7 +107,8 @@ Owns `egui::Context` + `egui_winit::State`. Pre-extracts overlay data before `eg
   - Width capped at 80% of window; filename truncated with `…` before extension
   - Uses `ctx.screen_rect().width()` for width (DPI-correct); `ui.style_mut().wrap_mode` prevents egui from wrapping
 - **Top-right**: mode name — 18 pt bold, fades out 5 s after mode change (1 s fade)
-- **Bottom-right**: image info panel (toggled with `I`) — filename, dimensions, ratio, file size, format; `movable(false)` so anchor is enforced every frame
+- **Bottom-right**: image info panel (toggled with `I`) — file info + EXIF data (camera, lens, exposure, date); `movable(false)` so anchor is enforced every frame
+- **Center**: loading indicator while prefetch/decode is in progress
 - **Window title**: `PikaViewer - filename.ext [pos/total]`
 - Minimum window size: 600×450 logical px — set via `LogicalSize` in `WindowAttributes` AND enforced in `clamped_size()` before every `request_inner_size` call
 
@@ -94,6 +129,8 @@ docker --context default create --name iv-extract pikaviewer-builder:latest
 docker --context default cp iv-extract:/usr/local/bin/pikaviewer target/release/pikaviewer
 docker --context default rm iv-extract
 ```
+
+The Dockerfile builds with `--features iv-app/heic` (HEIC enabled in Docker builds).
 
 ### Running
 
@@ -124,7 +161,7 @@ cargo build --release
 ./scripts/package-macos.sh --dmg     # → dist/macos/PikaViewer-0.1.0.dmg
 
 # With HEIC support (requires: brew install libheif)
-# The script auto-detects libheif via pkg-config and enables --features iv-app/heic
+# The script auto-detects libheif >= 1.18 via pkg-config and enables --features iv-app/heic
 ```
 
 The script builds arm64 only. Intel Macs run it via Rosetta 2 (all supported Intel Macs have it).
@@ -135,8 +172,9 @@ The script:
 1. Auto-detects `libheif >= 1.18` via `pkg-config` and enables HEIC/AVIF support if found
 2. Builds `aarch64-apple-darwin` release binary
 3. Creates `PikaViewer.app` bundle with `Info.plist` (file associations for all supported formats)
-4. Ad-hoc signs with `codesign --force --deep -s -` (no Apple Developer account needed)
-5. Optionally wraps in a `.dmg` with `/Applications` symlink for drag-install UX
+4. Bundles Homebrew dylibs into `Frameworks/` with `@rpath` rewriting for self-contained `.app`
+5. Ad-hoc signs with `codesign --force --deep -s -` (no Apple Developer account needed)
+6. Optionally wraps in a `.dmg` with `/Applications` symlink for drag-install UX
 
 **First launch:** Gatekeeper will warn about unsigned app. Right-click → Open to bypass once, or:
 ```bash
@@ -151,44 +189,65 @@ duti -s xyz.astrolabius.pikaviewer public.png all
 ```
 Or: Finder → Get Info on any image → Open with → Change All.
 
+## HEIC/AVIF support
+
+`iv-format-heic` is an **optional crate** that wraps libheif-rs (LGPL-3.0). It is intentionally
+**not** a workspace member — this way `cargo build` without `--features iv-app/heic` never
+requires libheif to be installed. The feature flag in `iv-app/Cargo.toml`:
+
+```toml
+[features]
+heic = ["dep:iv-format-heic", "iv-format-heic/libheif-rs"]
+```
+
+The crate has a stub fallback: when compiled without the `libheif-rs` sub-feature, `decode()`
+returns an error message telling the user to rebuild with `--features iv-app/heic`.
+
+Pre-built packages (Docker, macOS DMG) enable the feature by default.
+
 ## Repository
 
-`ssh://git@gitlab.astrolabius.xyz:2424/vinci/pikaviewer/pikaviewer.git` — branch `dev`
+GitHub: `github.com:vincentto13/pikaviewer.git`
+GitLab: `ssh://git@gitlab.astrolabius.xyz:2424/vinci/pikaviewer/pikaviewer.git`
 
 ## Current status
 
 - [x] Workspace scaffold (iv-core, iv-formats, iv-renderer, iv-app)
 - [x] FormatPlugin trait + PluginRegistry
 - [x] ImageList — alphabetical directory scan, wrap-around navigation
-- [x] image-rs plugin (JPEG, PNG, GIF, BMP, TIFF, WebP, ICO)
+- [x] image-rs plugin (JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, QOI)
 - [x] wgpu renderer — letterbox, aspect ratio always preserved
-- [x] Three display modes (Regular / Fullscreen / FixedSize)
+- [x] Two display modes (Window with fit_to_image toggle / Fullscreen)
+- [x] Zoom/pan — Viewport struct, shader Transform uniform, keyboard-driven
 - [x] Image rotation 90° CW/CCW via UV remapping
 - [x] egui overlay — filename (truncated, single-line, 80% max) + mode indicator with fade
 - [x] Window title bar with filename and index
-- [x] Regular mode: window never bigger than screen, never goes off-screen
+- [x] Window mode: window never bigger than screen, never goes off-screen
 - [x] Docker build (`rust:latest`, `--context default`)
-- [x] macOS packaging script — universal binary, `Info.plist` file associations, ad-hoc signing, optional DMG
+- [x] macOS packaging script — arm64, `Info.plist` file associations, ad-hoc signing, optional DMG
 - [x] macOS Finder "Open With" — ObjC runtime injection of `application:openURLs:` into winit's delegate
 - [x] Runtime file loading via `load_path()` — opens file + initializes directory listing
-- [x] Image info panel (`I` key) — dimensions, ratio, file size, format; egui::Window bottom-right
+- [x] Image info panel (`I` key) — dimensions, ratio, file size, format + EXIF data
 - [x] Minimum window size 600×450 (logical) enforced on creation and every resize
-- [x] Regular mode aspect ratio preserved when window is larger than image (min-size letterbox)
-- [x] Pushed to GitLab dev branch
+- [x] Aspect ratio preserved in all modes (letterbox into actual window size)
 - [x] EXIF data panel — camera, lens, exposure, date taken; shown in info panel
 - [x] EXIF auto-rotation — reads orientation tag, applies rotation on load
 - [x] Config file — TOML at `~/.config/pikaviewer/config.toml`
-- [x] HEIC/AVIF — `iv-format-heic` crate using libheif (optional feature)
+- [x] Settings window — separate winit window, shared GPU context, checkbox UI
+- [x] HEIC/AVIF — `iv-format-heic` crate using libheif (optional feature, stub fallback)
 - [x] File associations — `.desktop` + `xdg-mime` (Linux); macOS done via `Info.plist`
 - [x] Linux packaging — `.deb` + `.AppImage` via Docker
-- [x] macOS packaging — `.app` bundle + `.dmg` with icon generation
+- [x] macOS packaging — `.app` bundle + `.dmg` with icon generation, dylib bundling
 - [x] GitHub CI — check/clippy/test + release workflow for v* tags
 - [x] Async prefetch cache — background decode thread, LRU cache (5 entries), N±1 prefetch, loading indicator
+- [x] Premultiplied alpha — sRGB linearize → premultiply → sRGB encode, with LazyLock LUT
+- [x] EventLoopProxy wakeup — worker threads wake main loop directly (no polling)
+- [x] File deletion — `D` key with confirmation dialog, moves to trash on supported platforms
+- [x] Pedantic clippy — `#[must_use]`, safe `From` upcasts, doc backtick fixes
 
 ## Planned next phases
 
 1. **RAW formats** — `iv-format-raw` crate using LibRaw (LGPL, optional feature)
-2. **Zoom/pan** — Viewport struct; shader Transform uniform already designed for it
 
 ## macOS file-open mechanism (`macos_events.rs`)
 
