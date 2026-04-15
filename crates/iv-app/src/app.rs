@@ -24,8 +24,6 @@ const APP_NAME: &str = "PikaViewer";
 pub enum AppEvent {
     /// A background decode (prefetch or current image) completed.
     DecodeReady,
-    /// First image file found during scan — display it immediately.
-    StartupFirstFile(PathBuf),
     /// Periodic scan progress — partial sorted list available on `scan_rx`.
     ScanProgress,
     /// Full directory scan finished — final sorted list available on `scan_rx`.
@@ -302,16 +300,23 @@ impl App {
         let (scan_tx, scan_rx) = mpsc::channel();
         self.scan_rx = Some(scan_rx);
         self.scanning = true;
-        self.status = AppStatus::Loading;
 
+        // For file opens, show the image immediately on the main thread —
+        // no event round-trip, so no race with the scan thread.
+        let canonical = path.canonicalize().unwrap_or(path);
+        let is_file = canonical.is_file();
+        if is_file {
+            self.image_list = Some(ImageList::from_single(canonical.clone()));
+            self.load_current();
+        } else {
+            self.status = AppStatus::Loading;
+        }
+
+        let path = canonical;
         std::thread::Builder::new()
             .name("startup-scan".into())
             .spawn(move || {
-                let path = path.canonicalize().unwrap_or(path);
-                let is_file = path.is_file();
                 let dir = if is_file {
-                    // Show the chosen file immediately — no need for progress ticks
-                    let _ = proxy.send_event(AppEvent::StartupFirstFile(path.clone()));
                     path.parent().unwrap_or(Path::new(".")).to_path_buf()
                 } else {
                     path
@@ -1210,13 +1215,6 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::StartupFirstFile(path) => {
-                // Phase 1: show the first image immediately with a single-entry list
-                log::info!("first file ready: {}", path.display());
-                self.image_list = Some(ImageList::from_single(path));
-                self.load_current();
-            }
-
             AppEvent::ScanProgress | AppEvent::ScanComplete => {
                 let is_final = matches!(event, AppEvent::ScanComplete);
 
