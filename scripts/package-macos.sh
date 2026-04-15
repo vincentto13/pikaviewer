@@ -14,7 +14,7 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME="PikaViewer"
 BUNDLE_ID="xyz.astrolabius.pikaviewer"
-VERSION="0.1.0"
+VERSION="0.3.0"
 MIN_MACOS="12.0"
 BINARY_NAME="pikaviewer"
 TARGET="aarch64-apple-darwin"
