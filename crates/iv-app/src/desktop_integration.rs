@@ -228,7 +228,7 @@ mod macos {
     }
 
     /// Set `PikaViewer` as the default handler for all supported image UTIs.
-    pub fn set_default() -> anyhow::Result<()> {
+    pub fn set_default() {
         unsafe {
             let bundle_cf = cfstr(BUNDLE_ID);
 
@@ -250,7 +250,6 @@ mod macos {
 
             CFRelease(bundle_cf);
         }
-        Ok(())
     }
 }
 
@@ -265,7 +264,7 @@ pub fn set_default() -> anyhow::Result<()> {
     { linux::set_default() }
 
     #[cfg(target_os = "macos")]
-    { macos::set_default() }
+    { macos::set_default(); Ok(()) }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     { anyhow::bail!("set-as-default is not supported on this platform") }
