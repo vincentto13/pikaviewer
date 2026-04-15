@@ -101,7 +101,7 @@ mod linux {
         set_default()?;
 
         eprintln!("\nPikaViewer is now the default image viewer.");
-        eprintln!("To undo: {} --uninstall", bin);
+        eprintln!("To undo: {bin} --uninstall");
         Ok(())
     }
 
@@ -130,7 +130,7 @@ mod linux {
         Ok(())
     }
 
-    /// Set PikaViewer as the default handler for all supported MIME types.
+    /// Set `PikaViewer` as the default handler for all supported MIME types.
     pub fn set_default() -> anyhow::Result<()> {
         // Ensure .desktop file + icon exist
         let path = desktop_file_path();
@@ -227,7 +227,7 @@ mod macos {
         }
     }
 
-    /// Set PikaViewer as the default handler for all supported image UTIs.
+    /// Set `PikaViewer` as the default handler for all supported image UTIs.
     pub fn set_default() -> anyhow::Result<()> {
         unsafe {
             let bundle_cf = cfstr(BUNDLE_ID);
@@ -259,7 +259,7 @@ mod macos {
 #[cfg(target_os = "linux")]
 pub use linux::{install, uninstall};
 
-/// Set PikaViewer as the default image viewer for the current platform.
+/// Set `PikaViewer` as the default image viewer for the current platform.
 pub fn set_default() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     { linux::set_default() }

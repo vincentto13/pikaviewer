@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::{mpsc, Arc}, time::Instant};
+use std::{path::{Path, PathBuf}, sync::{mpsc, Arc}, time::Instant};
 
 use anyhow::Result;
 use winit::{
@@ -188,11 +188,10 @@ impl App {
 
             // Update overlay immediately so filename/index reflect the target
             let filename = path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let index = format!("[{}/{}]", list.position(), list.len());
-            self.current_filename = filename.clone();
-            self.current_index = index.clone();
+            self.current_filename.clone_from(&filename);
+            self.current_index.clone_from(&index);
             if let Some(w) = &self.window {
                 w.set_title(&format!("{APP_NAME} - {filename} {index}"));
                 w.request_redraw();
@@ -210,8 +209,7 @@ impl App {
 
         let filename = path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
 
         self.image_info = Some(ImageInfo {
             width:     entry.image.width,
@@ -226,8 +224,8 @@ impl App {
 
         let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
             .unwrap_or_default();
-        self.current_filename = filename.clone();
-        self.current_index    = index.clone();
+        self.current_filename.clone_from(&filename);
+        self.current_index.clone_from(&index);
         self.status = AppStatus::Ready;
 
         if let Some(w) = &self.window {
@@ -368,10 +366,10 @@ impl App {
         let Some(removed) = list.remove_current() else { return };
 
         if let Err(e) = std::fs::remove_file(&removed) {
-            log::error!("delete {:?}: {e}", removed);
+            log::error!("delete {}: {e}", removed.display());
             return;
         }
-        log::info!("deleted: {:?}", removed);
+        log::info!("deleted: {}", removed.display());
 
         if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
 
@@ -423,8 +421,7 @@ impl App {
         // window's anchor position), schedule a winit redraw immediately.
         let wants_repaint = full_output.viewport_output
             .get(&egui::ViewportId::ROOT)
-            .map(|vo| vo.repaint_delay == std::time::Duration::ZERO)
-            .unwrap_or(false);
+            .is_some_and(|vo| vo.repaint_delay == std::time::Duration::ZERO);
         if wants_repaint {
             window.request_redraw();
         }
@@ -445,8 +442,8 @@ impl App {
 /// converting via the window's current scale factor.
 fn clamped_size(window: &Window, w: u32, h: u32) -> PhysicalSize<u32> {
     let scale = window.scale_factor();
-    let min_w = (MIN_WINDOW_W as f64 * scale).round() as u32;
-    let min_h = (MIN_WINDOW_H as f64 * scale).round() as u32;
+    let min_w = (f64::from(MIN_WINDOW_W) * scale).round() as u32;
+    let min_h = (f64::from(MIN_WINDOW_H) * scale).round() as u32;
     PhysicalSize::new(w.max(min_w), h.max(min_h))
 }
 
@@ -489,11 +486,11 @@ struct FrameSnapshot {
 }
 
 fn draw_ui(ctx: &egui::Context, snap: &FrameSnapshot, image_info: Option<&ImageInfo>) {
-    // Use egui's own screen rect — always correct regardless of DPI scaling.
-    let win_w = ctx.screen_rect().width();
-
     // Frame inner margins: left(10) + right(10) = 20 logical px.
     const FRAME_H_MARGIN: f32 = 20.0;
+
+    // Use egui's own screen rect — always correct regardless of DPI scaling.
+    let win_w = ctx.screen_rect().width();
     // 80 % of window width is the outer overlay limit; subtract frame margins
     // to get the budget for the text content itself.
     let text_budget = win_w * 0.80 - FRAME_H_MARGIN;
@@ -736,8 +733,7 @@ fn draw_info_panel(ctx: &egui::Context, info: &ImageInfo) {
         .show(ctx, |ui| {
             let filename = info.file_path
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "—".to_string());
+                .map_or_else(|| "—".to_string(), |n| n.to_string_lossy().into_owned());
             info_row(ui, "File:", &filename);
             info_row(ui, "Dimensions:", &format!("{} × {}", info.width, info.height));
             let (rw, rh) = simplify_ratio(info.width, info.height);
@@ -823,7 +819,7 @@ fn format_file_size(bytes: u64) -> String {
 /// Truncate `filename` so it fits within `max_w` logical pixels at `font_id`.
 /// Preserves the file extension; inserts `…` before the extension.
 ///
-/// e.g. "very_long_photo_name.jpg" → "very_long_ph….jpg"
+/// e.g. `very_long_photo_name.jpg` → `very_long_ph….jpg`
 fn truncate_filename(
     ctx:      &egui::Context,
     filename: &str,
@@ -875,7 +871,7 @@ fn truncate_filename(
 /// Semi-transparent pill label. `font_size` in logical points; text is bold,
 /// single-line (wrapping disabled — caller is responsible for pre-truncation).
 fn overlay_label(ui: &mut egui::Ui, text: &str, alpha: u8, font_size: f32) {
-    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, (alpha as u16 * 160 / 255) as u8);
+    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, (u16::from(alpha) * 160 / 255) as u8);
     let fg = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
     egui::Frame {
         fill:         bg,
@@ -967,10 +963,9 @@ impl ApplicationHandler<AppEvent> for App {
         event: WindowEvent,
     ) {
         // ── Settings window events ───────────────────────────────────────────
-        if self.settings_window.as_ref().map(|sw| sw.window_id()) == Some(window_id) {
+        if self.settings_window.as_ref().map(SettingsWindow::window_id) == Some(window_id) {
             let should_close = self.settings_window.as_mut()
-                .map(|sw| sw.handle_event(&event, &mut self.settings))
-                .unwrap_or(false);
+                .is_some_and(|sw| sw.handle_event(&event, &mut self.settings));
             if should_close {
                 self.close_settings();
             }
@@ -993,8 +988,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if let Some(w) = &self.window {
                     if self.renderer.as_ref()
-                        .map(|r| r.display_mode == DisplayMode::Window && r.fit_to_image)
-                        .unwrap_or(false)
+                        .is_some_and(|r| r.display_mode == DisplayMode::Window && r.fit_to_image)
                     {
                         clamp_to_screen(w);
                     }
@@ -1058,8 +1052,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // Snapshot before match — may go stale if an arm mutates the
                 // renderer (e.g. navigate → reset_zoom), but no arm reads these
                 // values after such a mutation.
-                let is_zoomed = self.renderer.as_ref().map(|r| r.viewport.is_zoomed()).unwrap_or(false);
-                let zoom      = self.renderer.as_ref().map(|r| r.viewport.zoom()).unwrap_or(1.0);
+                let is_zoomed = self.renderer.as_ref().is_some_and(|r| r.viewport.is_zoomed());
+                let zoom      = self.renderer.as_ref().map_or(1.0, |r| r.viewport.zoom());
                 match logical_key {
                 Key::Named(NamedKey::ArrowRight) => {
                     if is_zoomed {
@@ -1102,14 +1096,14 @@ impl ApplicationHandler<AppEvent> for App {
                         event_loop.exit();
                     }
                     "m" | "M" => self.toggle_mode(),
-                    "r"       => self.rotate_image(true),
-                    "l"       => self.rotate_image(false),
+                    "r" | "]" => self.rotate_image(true),
+                    "l" | "[" => self.rotate_image(false),
                     "i"       => {
                         self.show_info = !self.show_info;
                         if let Some(w) = &self.window { w.request_redraw(); }
                     }
                     "d" | "D" => {
-                        if self.image_list.as_ref().map(|l| !l.is_empty()).unwrap_or(false) {
+                        if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) {
                             self.pending_delete = true;
                             if let Some(w) = &self.window { w.request_redraw(); }
                         }
@@ -1127,8 +1121,6 @@ impl ApplicationHandler<AppEvent> for App {
                             self.navigate(-1);
                         }
                     }
-                    "]"       => self.rotate_image(true),
-                    "["       => self.rotate_image(false),
                     "+" | "=" => self.zoom_in(),
                     "-"        => self.zoom_out(),
                     _ => {}
@@ -1173,7 +1165,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(ref mut cache) = self.prefetch {
                     let current_path = self.image_list.as_ref()
                         .and_then(|l| l.current())
-                        .map(|p| p.to_path_buf());
+                        .map(Path::to_path_buf);
 
                     for path in cache.poll_into_cache() {
                         if current_path.as_ref() == Some(&path) {
@@ -1207,8 +1199,7 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Repaint while mode indicator is fading (time-based animation).
         let needs_repaint = self.mode_changed_at
-            .map(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS)
-            .unwrap_or(false);
+            .is_some_and(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS);
 
         if needs_repaint {
             if let Some(w) = &self.window {

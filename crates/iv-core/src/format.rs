@@ -48,6 +48,7 @@ static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
 });
 
 fn linear_to_srgb_u8(l: f32) -> u8 {
+    #[allow(clippy::unreadable_literal)]
     let s = if l <= 0.0031308 {
         l * 12.92
     } else {
@@ -69,7 +70,7 @@ impl DecodedImage {
                 chunk[1] = 0;
                 chunk[2] = 0;
             } else if a < 255 {
-                let af = a as f32 / 255.0;
+                let af = f32::from(a) / 255.0;
                 chunk[0] = linear_to_srgb_u8(table[chunk[0] as usize] * af);
                 chunk[1] = linear_to_srgb_u8(table[chunk[1] as usize] * af);
                 chunk[2] = linear_to_srgb_u8(table[chunk[2] as usize] * af);
@@ -106,6 +107,7 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
+    #[must_use]
     pub fn new() -> Self { Self::default() }
 
     pub fn register(&mut self, plugin: impl FormatPlugin + 'static) {
@@ -116,9 +118,10 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .find(|p| p.supports_extension(ext))
-            .map(|p| p.as_ref())
+            .map(AsRef::as_ref)
     }
 
+    #[must_use]
     pub fn supported_extensions(&self) -> Vec<&str> {
         self.plugins
             .iter()

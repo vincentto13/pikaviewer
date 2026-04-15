@@ -29,9 +29,8 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
 
     let reader = exif::Reader::new();
     let mut cursor = std::io::Cursor::new(data);
-    let exif = match reader.read_from_container(&mut cursor) {
-        Ok(e)  => e,
-        Err(_) => return out,
+    let Ok(exif) = reader.read_from_container(&mut cursor) else {
+        return out;
     };
 
     let str_field = |tag| -> Option<String> {
@@ -41,7 +40,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
 
     out.orientation = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| match &f.value {
-            exif::Value::Short(v) if !v.is_empty() => Some(v[0] as u32),
+            exif::Value::Short(v) if !v.is_empty() => Some(u32::from(v[0])),
             _ => None,
         })
         .unwrap_or(0);
@@ -61,7 +60,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
                     let reduced = r.denom / r.num;
                     Some(format!("1/{reduced} s"))
                 } else {
-                    Some(format!("{:.1} s", r.num as f64 / r.denom as f64))
+                    Some(format!("{:.1} s", f64::from(r.num) / f64::from(r.denom)))
                 }
             }
             _ => None,
@@ -71,7 +70,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
         .and_then(|f| match &f.value {
             exif::Value::Rational(v) if !v.is_empty() => {
                 let r = v[0];
-                Some(format!("f/{:.1}", r.num as f64 / r.denom as f64))
+                Some(format!("f/{:.1}", f64::from(r.num) / f64::from(r.denom)))
             }
             _ => None,
         });
@@ -83,7 +82,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
         .and_then(|f| match &f.value {
             exif::Value::Rational(v) if !v.is_empty() => {
                 let r = v[0];
-                Some(format!("{:.0} mm", r.num as f64 / r.denom as f64))
+                Some(format!("{:.0} mm", f64::from(r.num) / f64::from(r.denom)))
             }
             _ => None,
         });
@@ -227,7 +226,7 @@ impl PrefetchCache {
     }
 
     /// Increment generation counter, causing stale prefetch to be skipped.
-    /// Clears in_flight so new requests for the same paths can be sent.
+    /// Clears `in_flight` so new requests for the same paths can be sent.
     pub fn bump_generation(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.in_flight.clear();

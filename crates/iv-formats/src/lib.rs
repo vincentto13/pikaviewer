@@ -31,6 +31,7 @@ impl FormatPlugin for ImageRsPlugin {
 // ── Registry builder ─────────────────────────────────────────────────────────
 
 /// Create a registry with all built-in plugins registered.
+#[must_use]
 pub fn default_registry() -> PluginRegistry {
     let mut r = PluginRegistry::new();
     r.register(ImageRsPlugin);

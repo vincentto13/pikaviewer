@@ -51,7 +51,7 @@ impl TransformUniform {
 
 // ── Vertex layout ─────────────────────────────────────────────────────────────
 
-/// Build 4 vertices (TL, TR, BL, BR) for a TriangleStrip unit quad.
+/// Build 4 vertices (TL, TR, BL, BR) for a `TriangleStrip` unit quad.
 ///
 /// Positions are always the full NDC quad `(-1,-1)` to `(1,1)`. The transform
 /// uniform (scale + translate) handles letterboxing, zoom, and pan.
@@ -159,7 +159,7 @@ impl Viewport {
 
     // ── Mutations ─────────────────────────────────────────────────────────────
 
-    /// Set zoom level, clamped to [min_zoom(), ZOOM_MAX]. Pan is re-clamped to
+    /// Set zoom level, clamped to [`min_zoom()`], [`ZOOM_MAX`]. Pan is re-clamped to
     /// the new bounds, keeping the image corner at the window corner on zoom-out.
     pub fn set_zoom(&mut self, zoom: f32) {
         self.zoom = zoom.clamp(self.min_zoom(), ZOOM_MAX);
@@ -320,7 +320,7 @@ impl Renderer {
         let size   = window.inner_size();
         let caps   = surface.get_capabilities(&adapter);
         let format = caps.formats.iter().copied()
-            .find(|f| f.is_srgb())
+            .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
@@ -460,8 +460,7 @@ impl Renderer {
 
         let screen_size = window
             .current_monitor()
-            .map(|m| { let s = m.size(); (s.width, s.height) })
-            .unwrap_or((1920, 1080));
+            .map_or((1920, 1080), |m| { let s = m.size(); (s.width, s.height) });
 
         let renderer = Self {
             surface,
