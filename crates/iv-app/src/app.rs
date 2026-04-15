@@ -308,15 +308,16 @@ impl App {
             .name("startup-scan".into())
             .spawn(move || {
                 let path = path.canonicalize().unwrap_or(path);
-                let dir = if path.is_file() {
-                    // Phase 1: send the file path immediately for display
+                let is_file = path.is_file();
+                let dir = if is_file {
+                    // Show the chosen file immediately — no need for progress ticks
                     let _ = proxy.send_event(AppEvent::StartupFirstFile(path.clone()));
                     path.parent().unwrap_or(Path::new(".")).to_path_buf()
                 } else {
                     path
                 };
 
-                // Scan directory with periodic progress updates
+                // Scan directory
                 let supported = registry.supported_extensions();
                 let read_dir = match std::fs::read_dir(&dir) {
                     Ok(rd) => rd,
@@ -341,22 +342,26 @@ impl App {
                     if !is_image { continue; }
 
                     entries.push(p);
-                    since_last_progress += 1;
 
-                    if since_last_progress >= SCAN_PROGRESS_INTERVAL {
-                        since_last_progress = 0;
-                        let mut snapshot = entries.clone();
-                        snapshot.sort_by(|a, b| {
-                            let an = a.file_name().unwrap_or_default();
-                            let bn = b.file_name().unwrap_or_default();
-                            an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                        });
-                        let _ = scan_tx.send(Ok(snapshot));
-                        let _ = proxy.send_event(AppEvent::ScanProgress);
+                    // Send periodic progress updates for directory opens only —
+                    // file opens already have an image showing, no need to tick.
+                    if !is_file {
+                        since_last_progress += 1;
+                        if since_last_progress >= SCAN_PROGRESS_INTERVAL {
+                            since_last_progress = 0;
+                            let mut snapshot = entries.clone();
+                            snapshot.sort_by(|a, b| {
+                                let an = a.file_name().unwrap_or_default();
+                                let bn = b.file_name().unwrap_or_default();
+                                an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+                            });
+                            let _ = scan_tx.send(Ok(snapshot));
+                            let _ = proxy.send_event(AppEvent::ScanProgress);
+                        }
                     }
                 }
 
-                // Final sorted list — ScanComplete clears the `…` indicator
+                // Final sorted list
                 entries.sort_by(|a, b| {
                     let an = a.file_name().unwrap_or_default();
                     let bn = b.file_name().unwrap_or_default();
@@ -364,7 +369,6 @@ impl App {
                 });
 
                 let _ = scan_tx.send(Ok(entries));
-                // Send ScanComplete (not ScanProgress) so the UI drops the `…`
                 let _ = proxy.send_event(AppEvent::ScanComplete);
             })
             .expect("failed to spawn startup thread");
