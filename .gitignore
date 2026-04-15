@@ -5,3 +5,4 @@ dist/
 .DS_Store
 assets/icon.icns
 BRUTAL-TODO.md
+Cargo.lock

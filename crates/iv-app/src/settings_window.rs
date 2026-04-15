@@ -52,7 +52,7 @@ impl SettingsWindow {
 
         let caps = surface.get_capabilities(&gpu.adapter);
         let format = caps.formats.iter().copied()
-            .find(|f| f.is_srgb())
+            .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
 
         let size = window.inner_size();
@@ -103,9 +103,8 @@ impl SettingsWindow {
         let response = self.egui_state.on_window_event(&self.window, event);
 
         match event {
-            WindowEvent::CloseRequested => return true,
-
-            WindowEvent::KeyboardInput {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
                 event: winit::event::KeyEvent {
                     logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
                     state: winit::event::ElementState::Pressed,
@@ -254,8 +253,7 @@ impl SettingsWindow {
         let wants_repaint = full_output.viewport_output
             .get(&egui::ViewportId::from_hash_of("settings"))
             .or_else(|| full_output.viewport_output.values().next())
-            .map(|vo| vo.repaint_delay == std::time::Duration::ZERO)
-            .unwrap_or(false);
+            .is_some_and(|vo| vo.repaint_delay == std::time::Duration::ZERO);
         if wants_repaint {
             self.window.request_redraw();
         }

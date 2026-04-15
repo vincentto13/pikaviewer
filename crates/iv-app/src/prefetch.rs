@@ -3,11 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
+use winit::event_loop::EventLoopProxy;
+
 use iv_core::format::{DecodedImage, PluginRegistry};
+
+use crate::app::AppEvent;
 
 // ── EXIF extraction (moved from app.rs so background worker can use it) ─────
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExifData {
     pub camera_make:   Option<String>,
     pub camera_model:  Option<String>,
@@ -25,9 +29,8 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
 
     let reader = exif::Reader::new();
     let mut cursor = std::io::Cursor::new(data);
-    let exif = match reader.read_from_container(&mut cursor) {
-        Ok(e)  => e,
-        Err(_) => return out,
+    let Ok(exif) = reader.read_from_container(&mut cursor) else {
+        return out;
     };
 
     let str_field = |tag| -> Option<String> {
@@ -37,7 +40,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
 
     out.orientation = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| match &f.value {
-            exif::Value::Short(v) if !v.is_empty() => Some(v[0] as u32),
+            exif::Value::Short(v) if !v.is_empty() => Some(u32::from(v[0])),
             _ => None,
         })
         .unwrap_or(0);
@@ -57,7 +60,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
                     let reduced = r.denom / r.num;
                     Some(format!("1/{reduced} s"))
                 } else {
-                    Some(format!("{:.1} s", r.num as f64 / r.denom as f64))
+                    Some(format!("{:.1} s", f64::from(r.num) / f64::from(r.denom)))
                 }
             }
             _ => None,
@@ -67,7 +70,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
         .and_then(|f| match &f.value {
             exif::Value::Rational(v) if !v.is_empty() => {
                 let r = v[0];
-                Some(format!("f/{:.1}", r.num as f64 / r.denom as f64))
+                Some(format!("f/{:.1}", f64::from(r.num) / f64::from(r.denom)))
             }
             _ => None,
         });
@@ -79,7 +82,7 @@ pub(crate) fn extract_exif(data: &[u8]) -> ExifData {
         .and_then(|f| match &f.value {
             exif::Value::Rational(v) if !v.is_empty() => {
                 let r = v[0];
-                Some(format!("{:.0} mm", r.num as f64 / r.denom as f64))
+                Some(format!("{:.0} mm", f64::from(r.num) / f64::from(r.denom)))
             }
             _ => None,
         });
@@ -104,7 +107,7 @@ struct DecodeRequest {
     generation: u64,
 }
 
-pub(crate) struct DecodeResult {
+struct DecodeResult {
     pub path: PathBuf,
     pub image: Result<DecodedImage, String>,
     pub exif: ExifData,
@@ -112,7 +115,7 @@ pub(crate) struct DecodeResult {
 }
 
 pub(crate) struct CacheEntry {
-    pub image: DecodedImage,
+    pub image: Arc<DecodedImage>,
     pub exif: ExifData,
     pub file_size: u64,
     last_used: u64,
@@ -133,7 +136,7 @@ pub(crate) struct PrefetchCache {
 }
 
 impl PrefetchCache {
-    pub fn new(registry: Arc<PluginRegistry>) -> Self {
+    pub fn new(registry: Arc<PluginRegistry>, proxy: EventLoopProxy<AppEvent>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<DecodeRequest>();
         let (result_tx, result_rx) = mpsc::channel::<DecodeResult>();
         let generation = Arc::new(AtomicU64::new(0));
@@ -142,7 +145,7 @@ impl PrefetchCache {
         std::thread::Builder::new()
             .name("prefetch-worker".into())
             .spawn(move || {
-                worker_loop(request_rx, result_tx, &registry, &gen_clone);
+                worker_loop(request_rx, result_tx, &registry, &gen_clone, proxy);
             })
             .expect("failed to spawn prefetch worker");
 
@@ -159,11 +162,18 @@ impl PrefetchCache {
     }
 
     /// Try to get a decoded image from cache. Returns None on miss.
+    /// The entry stays in cache (Arc clone is cheap).
     pub fn get(&mut self, path: &Path) -> Option<CacheEntry> {
-        self.cache.remove(path).map(|mut entry| {
-            self.use_counter += 1;
-            entry.last_used = self.use_counter;
-            entry
+        self.use_counter += 1;
+        let counter = self.use_counter;
+        self.cache.get_mut(path).map(|entry| {
+            entry.last_used = counter;
+            CacheEntry {
+                image:     Arc::clone(&entry.image),
+                exif:      entry.exif.clone(),
+                file_size: entry.file_size,
+                last_used: entry.last_used,
+            }
         })
     }
 
@@ -181,35 +191,33 @@ impl PrefetchCache {
         });
     }
 
-    /// Non-blocking drain of completed results. Inserts into cache.
-    pub fn poll(&mut self) -> Vec<DecodeResult> {
-        let mut ready = Vec::new();
+    /// Drain completed decode results from the worker thread, insert all into
+    /// cache, and return the paths that were successfully inserted.
+    pub fn poll_into_cache(&mut self) -> Vec<PathBuf> {
+        let mut inserted = Vec::new();
         while let Ok(result) = self.result_rx.try_recv() {
             self.in_flight.remove(&result.path);
-            if result.image.is_ok() {
-                // We'll return the result to the caller; they decide
-                // whether to consume it (current image) or let it cache.
-                ready.push(result);
-            } else {
-                log::error!("decode {}: {}", result.path.display(),
-                    result.image.as_ref().err().unwrap());
+            match result.image {
+                Ok(image) => {
+                    self.use_counter += 1;
+                    let path = result.path.clone();
+                    self.cache.insert(result.path, CacheEntry {
+                        image: Arc::new(image),
+                        exif: result.exif,
+                        file_size: result.file_size,
+                        last_used: self.use_counter,
+                    });
+                    inserted.push(path);
+                }
+                Err(e) => {
+                    log::error!("decode {}: {e}", result.path.display());
+                }
             }
         }
-        ready
-    }
-
-    /// Insert a decode result into cache (for prefetched images).
-    pub fn insert(&mut self, result: DecodeResult) {
-        if let Ok(image) = result.image {
-            self.use_counter += 1;
-            self.cache.insert(result.path, CacheEntry {
-                image,
-                exif: result.exif,
-                file_size: result.file_size,
-                last_used: self.use_counter,
-            });
+        if !inserted.is_empty() {
             self.evict_if_needed();
         }
+        inserted
     }
 
     /// Remove a path from cache (e.g. after file deletion).
@@ -218,7 +226,7 @@ impl PrefetchCache {
     }
 
     /// Increment generation counter, causing stale prefetch to be skipped.
-    /// Clears in_flight so new requests for the same paths can be sent.
+    /// Clears `in_flight` so new requests for the same paths can be sent.
     pub fn bump_generation(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.in_flight.clear();
@@ -243,6 +251,7 @@ fn worker_loop(
     tx: mpsc::Sender<DecodeResult>,
     registry: &PluginRegistry,
     generation: &AtomicU64,
+    proxy: EventLoopProxy<AppEvent>,
 ) {
     while let Ok(req) = rx.recv() {
         // Skip stale prefetch requests
@@ -267,6 +276,7 @@ fn worker_loop(
                     exif: ExifData::default(),
                     file_size: 0,
                 });
+                let _ = proxy.send_event(AppEvent::DecodeReady);
                 continue;
             }
         };
@@ -276,7 +286,10 @@ fn worker_loop(
             .unwrap_or("");
 
         let image = match registry.find_for_extension(ext) {
-            Some(plugin) => plugin.decode(&data).map_err(|e| e.to_string()),
+            Some(plugin) => plugin.decode(&data).map(|mut img| {
+                img.premultiply_alpha();
+                img
+            }).map_err(|e| e.to_string()),
             None => Err(format!("no plugin for '{ext}'")),
         };
 
@@ -291,5 +304,6 @@ fn worker_loop(
             exif,
             file_size,
         });
+        let _ = proxy.send_event(AppEvent::DecodeReady);
     }
 }

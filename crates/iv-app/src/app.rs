@@ -1,11 +1,11 @@
-use std::{path::PathBuf, sync::{mpsc, Arc}, time::Instant};
+use std::{path::{Path, PathBuf}, sync::{mpsc, Arc}, time::Instant};
 
 use anyhow::Result;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
     event::{ElementState, KeyEvent, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
 };
@@ -14,10 +14,19 @@ use iv_core::{format::PluginRegistry, image_list::ImageList};
 use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
-use crate::prefetch::{self, ExifData, PrefetchCache, DecodeResult};
+use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
 const APP_NAME: &str = "PikaViewer";
+
+/// Custom events sent to the winit event loop from background threads.
+#[derive(Debug)]
+pub enum AppEvent {
+    /// A background decode (prefetch or current image) completed.
+    DecodeReady,
+    /// The startup directory scan completed.
+    StartupReady,
+}
 
 // Duration for which the mode indicator stays visible before fading.
 const MODE_DISPLAY_SECS: f32 = 5.0;
@@ -75,6 +84,7 @@ pub struct App {
     image_list: Option<ImageList>,
     prefetch:   Option<PrefetchCache>,
     startup_rx: Option<mpsc::Receiver<StartupResult>>,
+    proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
 
     egui_ctx:   egui::Context,
@@ -97,6 +107,9 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Persist window size on exit (not on every resize).
+        self.settings.save();
+
         // Drop prefetch first — dropping request_tx causes worker thread exit.
         // Then wgpu resources in dependency order:
         // 1. prefetch       (worker thread, no GPU deps)
@@ -112,7 +125,11 @@ impl Drop for App {
 }
 
 impl App {
-    pub fn new(start_path: Option<PathBuf>, registry: Arc<PluginRegistry>) -> Self {
+    pub fn new(
+        start_path: Option<PathBuf>,
+        registry: Arc<PluginRegistry>,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Self {
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals {
             window_shadow: egui::epaint::Shadow::NONE,
@@ -130,6 +147,7 @@ impl App {
             image_list: None,
             prefetch:   None,
             startup_rx: None,
+            proxy,
             status:     AppStatus::Ready,
             egui_ctx,
             egui_state: None,
@@ -158,13 +176,7 @@ impl App {
             if let Some(entry) = cache.get(&path) {
                 log::debug!("cache hit: {}", path.display());
                 self.status = AppStatus::Ready;
-                let result = DecodeResult {
-                    path: path.clone(),
-                    image: Ok(entry.image),
-                    exif: entry.exif,
-                    file_size: entry.file_size,
-                };
-                self.apply_decode_result(result);
+                self.apply_cache_entry(path, entry);
                 self.trigger_prefetch();
                 return;
             }
@@ -176,11 +188,10 @@ impl App {
 
             // Update overlay immediately so filename/index reflect the target
             let filename = path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let index = format!("[{}/{}]", list.position(), list.len());
-            self.current_filename = filename.clone();
-            self.current_index = index.clone();
+            self.current_filename.clone_from(&filename);
+            self.current_index.clone_from(&index);
             if let Some(w) = &self.window {
                 w.set_title(&format!("{APP_NAME} - {filename} {index}"));
                 w.request_redraw();
@@ -189,42 +200,32 @@ impl App {
 
     }
 
-    /// Apply a completed decode result: set texture, EXIF rotation, update overlays.
-    fn apply_decode_result(&mut self, result: DecodeResult) {
-        let mut image = match result.image {
-            Ok(img) => img,
-            Err(e) => {
-                log::error!("decode {}: {e}", result.path.display());
-                self.status = AppStatus::Ready;
-                return;
-            }
-        };
-
+    /// Apply a cache entry: set texture, EXIF rotation, update overlays.
+    fn apply_cache_entry(&mut self, path: PathBuf, entry: CacheEntry) {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let list = self.image_list.as_ref();
 
-        renderer.rotation = prefetch::orientation_rotation(result.exif.orientation);
+        renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
 
-        let filename = result.path
+        let filename = path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| result.path.display().to_string());
+            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
 
         self.image_info = Some(ImageInfo {
-            width:     image.width,
-            height:    image.height,
-            file_size: result.file_size,
-            file_path: result.path,
-            exif:      result.exif,
+            width:     entry.image.width,
+            height:    entry.image.height,
+            file_size: entry.file_size,
+            file_path: path,
+            exif:      entry.exif,
         });
 
-        renderer.set_image(&mut image);
-        log::debug!("loaded {}×{} {}", image.width, image.height, filename);
+        renderer.set_image(&entry.image);
+        log::debug!("loaded {}×{} {}", entry.image.width, entry.image.height, filename);
 
         let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
             .unwrap_or_default();
-        self.current_filename = filename.clone();
-        self.current_index    = index.clone();
+        self.current_filename.clone_from(&filename);
+        self.current_index.clone_from(&index);
         self.status = AppStatus::Ready;
 
         if let Some(w) = &self.window {
@@ -260,6 +261,7 @@ impl App {
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
 
         let registry = Arc::clone(&self.registry);
+        let proxy = self.proxy.clone();
         let (tx, rx) = mpsc::channel();
         self.startup_rx = Some(rx);
         self.status = AppStatus::Loading;
@@ -274,6 +276,7 @@ impl App {
                     ImageList::from_directory(&path, &registry)
                 };
                 let _ = tx.send(result.map_err(|e| e.to_string()));
+                let _ = proxy.send_event(AppEvent::StartupReady);
             })
             .expect("failed to spawn startup thread");
     }
@@ -363,10 +366,10 @@ impl App {
         let Some(removed) = list.remove_current() else { return };
 
         if let Err(e) = std::fs::remove_file(&removed) {
-            log::error!("delete {:?}: {e}", removed);
+            log::error!("delete {}: {e}", removed.display());
             return;
         }
-        log::info!("deleted: {:?}", removed);
+        log::info!("deleted: {}", removed.display());
 
         if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
 
@@ -418,8 +421,7 @@ impl App {
         // window's anchor position), schedule a winit redraw immediately.
         let wants_repaint = full_output.viewport_output
             .get(&egui::ViewportId::ROOT)
-            .map(|vo| vo.repaint_delay == std::time::Duration::ZERO)
-            .unwrap_or(false);
+            .is_some_and(|vo| vo.repaint_delay == std::time::Duration::ZERO);
         if wants_repaint {
             window.request_redraw();
         }
@@ -440,8 +442,8 @@ impl App {
 /// converting via the window's current scale factor.
 fn clamped_size(window: &Window, w: u32, h: u32) -> PhysicalSize<u32> {
     let scale = window.scale_factor();
-    let min_w = (MIN_WINDOW_W as f64 * scale).round() as u32;
-    let min_h = (MIN_WINDOW_H as f64 * scale).round() as u32;
+    let min_w = (f64::from(MIN_WINDOW_W) * scale).round() as u32;
+    let min_h = (f64::from(MIN_WINDOW_H) * scale).round() as u32;
     PhysicalSize::new(w.max(min_w), h.max(min_h))
 }
 
@@ -484,11 +486,11 @@ struct FrameSnapshot {
 }
 
 fn draw_ui(ctx: &egui::Context, snap: &FrameSnapshot, image_info: Option<&ImageInfo>) {
-    // Use egui's own screen rect — always correct regardless of DPI scaling.
-    let win_w = ctx.screen_rect().width();
-
     // Frame inner margins: left(10) + right(10) = 20 logical px.
     const FRAME_H_MARGIN: f32 = 20.0;
+
+    // Use egui's own screen rect — always correct regardless of DPI scaling.
+    let win_w = ctx.screen_rect().width();
     // 80 % of window width is the outer overlay limit; subtract frame margins
     // to get the budget for the text content itself.
     let text_budget = win_w * 0.80 - FRAME_H_MARGIN;
@@ -731,8 +733,7 @@ fn draw_info_panel(ctx: &egui::Context, info: &ImageInfo) {
         .show(ctx, |ui| {
             let filename = info.file_path
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "—".to_string());
+                .map_or_else(|| "—".to_string(), |n| n.to_string_lossy().into_owned());
             info_row(ui, "File:", &filename);
             info_row(ui, "Dimensions:", &format!("{} × {}", info.width, info.height));
             let (rw, rh) = simplify_ratio(info.width, info.height);
@@ -818,7 +819,7 @@ fn format_file_size(bytes: u64) -> String {
 /// Truncate `filename` so it fits within `max_w` logical pixels at `font_id`.
 /// Preserves the file extension; inserts `…` before the extension.
 ///
-/// e.g. "very_long_photo_name.jpg" → "very_long_ph….jpg"
+/// e.g. `very_long_photo_name.jpg` → `very_long_ph….jpg`
 fn truncate_filename(
     ctx:      &egui::Context,
     filename: &str,
@@ -870,7 +871,7 @@ fn truncate_filename(
 /// Semi-transparent pill label. `font_size` in logical points; text is bold,
 /// single-line (wrapping disabled — caller is responsible for pre-truncation).
 fn overlay_label(ui: &mut egui::Ui, text: &str, alpha: u8, font_size: f32) {
-    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, (alpha as u16 * 160 / 255) as u8);
+    let bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, (u16::from(alpha) * 160 / 255) as u8);
     let fg = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
     egui::Frame {
         fill:         bg,
@@ -892,7 +893,7 @@ fn overlay_label(ui: &mut egui::Ui, text: &str, alpha: u8, font_size: f32) {
 
 // ── winit ApplicationHandler ──────────────────────────────────────────────────
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Use saved window size when in fixed-size mode, otherwise default.
         let initial_size = if self.settings.window.fit_to_image {
@@ -930,10 +931,11 @@ impl ApplicationHandler for App {
         self.renderer   = Some(renderer);
         self.gpu        = Some(gpu);
         self.egui_state = Some(egui_state);
-        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry)));
+        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry), self.proxy.clone()));
 
         if let Some(path) = self.start_path.clone() {
             let registry = Arc::clone(&self.registry);
+            let proxy = self.proxy.clone();
             let (tx, rx) = mpsc::channel();
             self.startup_rx = Some(rx);
             self.status = AppStatus::Loading;
@@ -948,6 +950,7 @@ impl ApplicationHandler for App {
                         ImageList::from_directory(&path, &registry)
                     };
                     let _ = tx.send(result.map_err(|e| e.to_string()));
+                    let _ = proxy.send_event(AppEvent::StartupReady);
                 })
                 .expect("failed to spawn startup thread");
         }
@@ -960,10 +963,9 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         // ── Settings window events ───────────────────────────────────────────
-        if self.settings_window.as_ref().map(|sw| sw.window_id()) == Some(window_id) {
+        if self.settings_window.as_ref().map(SettingsWindow::window_id) == Some(window_id) {
             let should_close = self.settings_window.as_mut()
-                .map(|sw| sw.handle_event(&event, &mut self.settings))
-                .unwrap_or(false);
+                .is_some_and(|sw| sw.handle_event(&event, &mut self.settings));
             if should_close {
                 self.close_settings();
             }
@@ -986,19 +988,17 @@ impl ApplicationHandler for App {
                 }
                 if let Some(w) = &self.window {
                     if self.renderer.as_ref()
-                        .map(|r| r.display_mode == DisplayMode::Window && r.fit_to_image)
-                        .unwrap_or(false)
+                        .is_some_and(|r| r.display_mode == DisplayMode::Window && r.fit_to_image)
                     {
                         clamp_to_screen(w);
                     }
                     w.request_redraw();
                 }
 
-                // Save window size for fixed-size mode restoration.
+                // Track window size for fixed-size mode (saved on exit).
                 if !self.settings.window.fit_to_image && size.width > 0 && size.height > 0 {
                     self.settings.window.width  = size.width;
                     self.settings.window.height = size.height;
-                    self.settings.save();
                 }
             }
 
@@ -1052,8 +1052,8 @@ impl ApplicationHandler for App {
                 // Snapshot before match — may go stale if an arm mutates the
                 // renderer (e.g. navigate → reset_zoom), but no arm reads these
                 // values after such a mutation.
-                let is_zoomed = self.renderer.as_ref().map(|r| r.viewport.is_zoomed()).unwrap_or(false);
-                let zoom      = self.renderer.as_ref().map(|r| r.viewport.zoom()).unwrap_or(1.0);
+                let is_zoomed = self.renderer.as_ref().is_some_and(|r| r.viewport.is_zoomed());
+                let zoom      = self.renderer.as_ref().map_or(1.0, |r| r.viewport.zoom());
                 match logical_key {
                 Key::Named(NamedKey::ArrowRight) => {
                     if is_zoomed {
@@ -1096,14 +1096,14 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     "m" | "M" => self.toggle_mode(),
-                    "r"       => self.rotate_image(true),
-                    "l"       => self.rotate_image(false),
+                    "r" | "]" => self.rotate_image(true),
+                    "l" | "[" => self.rotate_image(false),
                     "i"       => {
                         self.show_info = !self.show_info;
                         if let Some(w) = &self.window { w.request_redraw(); }
                     }
                     "d" | "D" => {
-                        if self.image_list.as_ref().map(|l| !l.is_empty()).unwrap_or(false) {
+                        if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) {
                             self.pending_delete = true;
                             if let Some(w) = &self.window { w.request_redraw(); }
                         }
@@ -1121,8 +1121,6 @@ impl ApplicationHandler for App {
                             self.navigate(-1);
                         }
                     }
-                    "]"       => self.rotate_image(true),
-                    "["       => self.rotate_image(false),
                     "+" | "=" => self.zoom_in(),
                     "-"        => self.zoom_out(),
                     _ => {}
@@ -1132,6 +1130,58 @@ impl ApplicationHandler for App {
             },
 
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::StartupReady => {
+                let result = self.startup_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+                if let Some(result) = result {
+                    self.startup_rx = None;
+                    match result {
+                        Ok(list) => {
+                            if list.is_empty() {
+                                log::warn!("no supported images found");
+                                self.status = AppStatus::EmptyFolder;
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            } else {
+                                log::info!("directory scan complete: {} images", list.len());
+                                self.image_list = Some(list);
+                                self.load_current();
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("build image list: {e}");
+                            self.status = AppStatus::FolderNotFound;
+                            if let Some(w) = &self.window { w.request_redraw(); }
+                        }
+                    }
+                }
+            }
+
+            AppEvent::DecodeReady => {
+                let mut current_path_ready: Option<PathBuf> = None;
+                if let Some(ref mut cache) = self.prefetch {
+                    let current_path = self.image_list.as_ref()
+                        .and_then(|l| l.current())
+                        .map(Path::to_path_buf);
+
+                    for path in cache.poll_into_cache() {
+                        if current_path.as_ref() == Some(&path) {
+                            cache.waiting_for_current = false;
+                            current_path_ready = Some(path);
+                        }
+                    }
+                }
+                if let Some(path) = current_path_ready {
+                    let entry = self.prefetch.as_mut().and_then(|c| c.get(&path));
+                    if let Some(entry) = entry {
+                        self.apply_cache_entry(path, entry);
+                        self.trigger_prefetch();
+                    }
+                }
+            }
         }
     }
 
@@ -1147,60 +1197,11 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Poll startup thread (directory scan on background thread)
-        if self.startup_rx.is_some() {
-            let result = self.startup_rx.as_ref().unwrap().try_recv().ok();
-            if let Some(result) = result {
-                self.startup_rx = None; // one-shot
-                match result {
-                    Ok(list) => {
-                        if list.is_empty() {
-                            log::warn!("no supported images found");
-                            self.status = AppStatus::EmptyFolder;
-                            if let Some(w) = &self.window { w.request_redraw(); }
-                        } else {
-                            log::info!("directory scan complete: {} images", list.len());
-                            self.image_list = Some(list);
-                            self.load_current();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("build image list: {e}");
-                        self.status = AppStatus::FolderNotFound;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                }
-            }
-        }
-
-        // Poll background decode results — collect first to avoid borrow conflict
-        let mut current_result: Option<DecodeResult> = None;
-        if let Some(ref mut cache) = self.prefetch {
-            let results = cache.poll();
-            let current_path = self.image_list.as_ref()
-                .and_then(|l| l.current())
-                .map(|p| p.to_path_buf());
-
-            for result in results {
-                if current_path.as_ref() == Some(&result.path) {
-                    cache.waiting_for_current = false;
-                    current_result = Some(result);
-                } else {
-                    cache.insert(result);
-                }
-            }
-        }
-        if let Some(result) = current_result {
-            self.apply_decode_result(result);
-            self.trigger_prefetch();
-        }
-
+        // Repaint while mode indicator is fading (time-based animation).
         let needs_repaint = self.mode_changed_at
-            .map(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS)
-            .unwrap_or(false);
+            .is_some_and(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS);
 
-        // Repaint if mode indicator is fading or we're waiting for a decode
-        if needs_repaint || self.status == AppStatus::Loading {
+        if needs_repaint {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }

@@ -24,18 +24,17 @@ impl ImageList {
     pub fn from_directory(dir: &Path, registry: &PluginRegistry) -> io::Result<Self> {
         let supported = registry.supported_extensions();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| {
                 p.is_file()
                     && p.extension()
                         .and_then(|e| e.to_str())
-                        .map(|ext| {
+                        .is_some_and(|ext| {
                             supported
                                 .iter()
                                 .any(|s| s.eq_ignore_ascii_case(ext))
                         })
-                        .unwrap_or(false)
             })
             .collect();
 
@@ -48,8 +47,11 @@ impl ImageList {
         Ok(Self { entries, current: 0 })
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    #[must_use]
     pub fn len(&self)     -> usize { self.entries.len() }
+    #[must_use]
     pub fn position(&self) -> usize { self.current + 1 }
 
     pub fn current(&self) -> Option<&Path> {

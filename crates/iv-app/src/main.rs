@@ -5,6 +5,7 @@ use clap::Parser;
 use iv_core::format::PluginRegistry;
 use iv_formats::default_registry;
 use winit::event_loop::EventLoop;
+use app::AppEvent;
 
 mod app;
 mod config;
@@ -121,7 +122,8 @@ fn main() -> anyhow::Result<()> {
         None => std::env::current_dir().ok(),
     };
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
 
     // macOS: inject application:openURLs: into the delegate class NOW (if the
     // delegate is set already) AND register a WillFinishLaunching notification
@@ -130,6 +132,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     macos_events::register();
 
-    event_loop.run_app(&mut App::new(start_path, Arc::new(build_registry())))?;
+    event_loop.run_app(&mut App::new(start_path, Arc::new(build_registry()), proxy))?;
     Ok(())
 }

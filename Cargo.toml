@@ -32,3 +32,21 @@ kamadak-exif = "0.5"
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
+
+# ── Lints ────────────────────────────────────────────────────────────────────
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Noise in a graphics / windowing app — intentional and harmless:
+cast_precision_loss      = "allow"   # u32→f32 for pixel math is standard
+cast_possible_truncation = "allow"   # clamped values cast safely
+cast_sign_loss           = "allow"   # same
+cast_possible_wrap       = "allow"   # u32→i32 for window position math
+cast_lossless            = "allow"   # u8→f32 `as` is idiomatic in pixel code
+missing_errors_doc       = "allow"   # internal code, not a public API
+too_many_lines           = "allow"   # splitting event handlers hurts readability
+must_use_candidate       = "allow"   # not worth adding everywhere
+return_self_not_must_use = "allow"   # same
+doc_markdown             = "allow"   # backtick pedantry in internal docs
+struct_field_names       = "allow"   # e.g. egui_renderer on Renderer is clear
+module_name_repetitions  = "allow"   # e.g. FormatError in format module
+needless_pass_by_value   = "allow"   # thread entry points need owned values

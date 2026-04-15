@@ -2,8 +2,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
     /// Window mode — behavior depends on `fit_to_image` setting:
-    /// - fit_to_image=true:  window resizes to image (min 400×300, capped at screen)
-    /// - fit_to_image=false: window stays at a fixed size, image letterboxed
+    /// - `fit_to_image=true`:  window resizes to image (min 400x300, capped at screen)
+    /// - `fit_to_image=false`: window stays at a fixed size, image letterboxed
     Window,
     /// OS borderless fullscreen; image is letterboxed to fit.
     Fullscreen,
@@ -11,6 +11,7 @@ pub enum DisplayMode {
 
 impl DisplayMode {
     /// Toggle between Window and Fullscreen.
+    #[must_use]
     pub fn next(self) -> Self {
         match self {
             Self::Window     => Self::Fullscreen,
@@ -18,6 +19,7 @@ impl DisplayMode {
         }
     }
 
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Window     => "Window",
@@ -29,8 +31,9 @@ impl DisplayMode {
 /// Returns the window size to request for the given image and mode.
 /// `None` means don't resize (Fullscreen, or fixed-size window mode).
 ///
-/// `screen_size` is the monitor's usable size (used only in Window+fit_to_image
+/// `screen_size` is the monitor's usable size (used only in `Window`+`fit_to_image`
 /// mode to cap the window).
+#[must_use]
 pub fn compute_window_request(
     mode: DisplayMode,
     image_size: (u32, u32),
