@@ -364,6 +364,7 @@ impl App {
                     }
                 }
 
+                // Final sorted list — ScanComplete clears the `…` indicator
                 entries.sort_by(|a, b| {
                     let an = a.file_name().unwrap_or_default();
                     let bn = b.file_name().unwrap_or_default();
@@ -371,6 +372,7 @@ impl App {
                 });
 
                 let _ = scan_tx.send(Ok(entries));
+                // Send ScanComplete (not ScanProgress) so the UI drops the `…`
                 let _ = proxy.send_event(AppEvent::ScanComplete);
             })
             .expect("failed to spawn startup thread");
@@ -1270,6 +1272,9 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
+                } else if is_final {
+                    // No new data but scan finished — refresh index to drop the `…`
+                    self.update_index_display();
                 }
             }
 
