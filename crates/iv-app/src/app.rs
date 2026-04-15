@@ -107,6 +107,9 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Persist window size on exit (not on every resize).
+        self.settings.save();
+
         // Drop prefetch first — dropping request_tx causes worker thread exit.
         // Then wgpu resources in dependency order:
         // 1. prefetch       (worker thread, no GPU deps)
@@ -998,11 +1001,10 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_redraw();
                 }
 
-                // Save window size for fixed-size mode restoration.
+                // Track window size for fixed-size mode (saved on exit).
                 if !self.settings.window.fit_to_image && size.width > 0 && size.height > 0 {
                     self.settings.window.width  = size.width;
                     self.settings.window.height = size.height;
-                    self.settings.save();
                 }
             }
 
