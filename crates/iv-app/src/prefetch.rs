@@ -7,7 +7,7 @@ use iv_core::format::{DecodedImage, PluginRegistry};
 
 // ── EXIF extraction (moved from app.rs so background worker can use it) ─────
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExifData {
     pub camera_make:   Option<String>,
     pub camera_model:  Option<String>,
@@ -104,7 +104,7 @@ struct DecodeRequest {
     generation: u64,
 }
 
-pub(crate) struct DecodeResult {
+struct DecodeResult {
     pub path: PathBuf,
     pub image: Result<DecodedImage, String>,
     pub exif: ExifData,
@@ -112,7 +112,7 @@ pub(crate) struct DecodeResult {
 }
 
 pub(crate) struct CacheEntry {
-    pub image: DecodedImage,
+    pub image: Arc<DecodedImage>,
     pub exif: ExifData,
     pub file_size: u64,
     last_used: u64,
@@ -159,11 +159,18 @@ impl PrefetchCache {
     }
 
     /// Try to get a decoded image from cache. Returns None on miss.
+    /// The entry stays in cache (Arc clone is cheap).
     pub fn get(&mut self, path: &Path) -> Option<CacheEntry> {
-        self.cache.remove(path).map(|mut entry| {
-            self.use_counter += 1;
-            entry.last_used = self.use_counter;
-            entry
+        self.use_counter += 1;
+        let counter = self.use_counter;
+        self.cache.get_mut(path).map(|entry| {
+            entry.last_used = counter;
+            CacheEntry {
+                image:     Arc::clone(&entry.image),
+                exif:      entry.exif.clone(),
+                file_size: entry.file_size,
+                last_used: entry.last_used,
+            }
         })
     }
 
@@ -181,35 +188,33 @@ impl PrefetchCache {
         });
     }
 
-    /// Non-blocking drain of completed results. Inserts into cache.
-    pub fn poll(&mut self) -> Vec<DecodeResult> {
-        let mut ready = Vec::new();
+    /// Drain completed decode results from the worker thread, insert all into
+    /// cache, and return the paths that were successfully inserted.
+    pub fn poll_into_cache(&mut self) -> Vec<PathBuf> {
+        let mut inserted = Vec::new();
         while let Ok(result) = self.result_rx.try_recv() {
             self.in_flight.remove(&result.path);
-            if result.image.is_ok() {
-                // We'll return the result to the caller; they decide
-                // whether to consume it (current image) or let it cache.
-                ready.push(result);
-            } else {
-                log::error!("decode {}: {}", result.path.display(),
-                    result.image.as_ref().err().unwrap());
+            match result.image {
+                Ok(image) => {
+                    self.use_counter += 1;
+                    let path = result.path.clone();
+                    self.cache.insert(result.path, CacheEntry {
+                        image: Arc::new(image),
+                        exif: result.exif,
+                        file_size: result.file_size,
+                        last_used: self.use_counter,
+                    });
+                    inserted.push(path);
+                }
+                Err(e) => {
+                    log::error!("decode {}: {e}", result.path.display());
+                }
             }
         }
-        ready
-    }
-
-    /// Insert a decode result into cache (for prefetched images).
-    pub fn insert(&mut self, result: DecodeResult) {
-        if let Ok(image) = result.image {
-            self.use_counter += 1;
-            self.cache.insert(result.path, CacheEntry {
-                image,
-                exif: result.exif,
-                file_size: result.file_size,
-                last_used: self.use_counter,
-            });
+        if !inserted.is_empty() {
             self.evict_if_needed();
         }
+        inserted
     }
 
     /// Remove a path from cache (e.g. after file deletion).

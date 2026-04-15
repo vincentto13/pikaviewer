@@ -14,7 +14,7 @@ use iv_core::{format::PluginRegistry, image_list::ImageList};
 use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
-use crate::prefetch::{self, ExifData, PrefetchCache, DecodeResult};
+use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
 const APP_NAME: &str = "PikaViewer";
@@ -158,13 +158,7 @@ impl App {
             if let Some(entry) = cache.get(&path) {
                 log::debug!("cache hit: {}", path.display());
                 self.status = AppStatus::Ready;
-                let result = DecodeResult {
-                    path: path.clone(),
-                    image: Ok(entry.image),
-                    exif: entry.exif,
-                    file_size: entry.file_size,
-                };
-                self.apply_decode_result(result);
+                self.apply_cache_entry(path, entry);
                 self.trigger_prefetch();
                 return;
             }
@@ -189,37 +183,28 @@ impl App {
 
     }
 
-    /// Apply a completed decode result: set texture, EXIF rotation, update overlays.
-    fn apply_decode_result(&mut self, result: DecodeResult) {
-        let image = match result.image {
-            Ok(img) => img,
-            Err(e) => {
-                log::error!("decode {}: {e}", result.path.display());
-                self.status = AppStatus::Ready;
-                return;
-            }
-        };
-
+    /// Apply a cache entry: set texture, EXIF rotation, update overlays.
+    fn apply_cache_entry(&mut self, path: PathBuf, entry: CacheEntry) {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let list = self.image_list.as_ref();
 
-        renderer.rotation = prefetch::orientation_rotation(result.exif.orientation);
+        renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
 
-        let filename = result.path
+        let filename = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| result.path.display().to_string());
+            .unwrap_or_else(|| path.display().to_string());
 
         self.image_info = Some(ImageInfo {
-            width:     image.width,
-            height:    image.height,
-            file_size: result.file_size,
-            file_path: result.path,
-            exif:      result.exif,
+            width:     entry.image.width,
+            height:    entry.image.height,
+            file_size: entry.file_size,
+            file_path: path,
+            exif:      entry.exif,
         });
 
-        renderer.set_image(&image);
-        log::debug!("loaded {}×{} {}", image.width, image.height, filename);
+        renderer.set_image(&entry.image);
+        log::debug!("loaded {}×{} {}", entry.image.width, entry.image.height, filename);
 
         let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
             .unwrap_or_default();
@@ -1173,26 +1158,27 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Poll background decode results — collect first to avoid borrow conflict
-        let mut current_result: Option<DecodeResult> = None;
+        // Poll background decode results — all go into cache.
+        // If the current image was among them, apply it.
+        let mut current_path_ready: Option<PathBuf> = None;
         if let Some(ref mut cache) = self.prefetch {
-            let results = cache.poll();
             let current_path = self.image_list.as_ref()
                 .and_then(|l| l.current())
                 .map(|p| p.to_path_buf());
 
-            for result in results {
-                if current_path.as_ref() == Some(&result.path) {
+            for path in cache.poll_into_cache() {
+                if current_path.as_ref() == Some(&path) {
                     cache.waiting_for_current = false;
-                    current_result = Some(result);
-                } else {
-                    cache.insert(result);
+                    current_path_ready = Some(path);
                 }
             }
         }
-        if let Some(result) = current_result {
-            self.apply_decode_result(result);
-            self.trigger_prefetch();
+        if let Some(path) = current_path_ready {
+            let entry = self.prefetch.as_mut().and_then(|c| c.get(&path));
+            if let Some(entry) = entry {
+                self.apply_cache_entry(path, entry);
+                self.trigger_prefetch();
+            }
         }
 
         let needs_repaint = self.mode_changed_at
