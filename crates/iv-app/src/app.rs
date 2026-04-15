@@ -33,7 +33,7 @@ pub enum AppEvent {
 }
 
 /// How often (in number of new images found) to send a `ScanProgress` update.
-const SCAN_PROGRESS_INTERVAL: usize = 5;
+const SCAN_PROGRESS_INTERVAL: usize = 1;
 
 // Duration for which the mode indicator stays visible before fading.
 const MODE_DISPLAY_SECS: f32 = 5.0;
@@ -176,10 +176,10 @@ impl App {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    /// Format the position index string, showing `…` while scan is in progress.
+    /// Format the position index string, appending `…` while scan is in progress.
     fn format_index(list: &ImageList, scanning: bool) -> String {
         if scanning {
-            format!("[{}/\u{2026}]", list.position())
+            format!("[{}/{}…]", list.position(), list.len())
         } else {
             format!("[{}/{}]", list.position(), list.len())
         }
