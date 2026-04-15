@@ -31,16 +31,16 @@ impl ImageList {
         let supported = registry.supported_extensions();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
             .filter(|p| {
-                p.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| {
-                            supported
-                                .iter()
-                                .any(|s| s.eq_ignore_ascii_case(ext))
-                        })
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        supported
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(ext))
+                    })
             })
             .collect();
 

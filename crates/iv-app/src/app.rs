@@ -337,8 +337,11 @@ impl App {
                 let mut since_last_progress: usize = 0;
 
                 for entry in read_dir.filter_map(Result::ok) {
+                    // Use file_type() from DirEntry (cached from readdir, no
+                    // extra stat syscall) — critical on slow network drives.
+                    let is_file = entry.file_type().is_ok_and(|ft| ft.is_file());
+                    if !is_file { continue; }
                     let p = entry.path();
-                    if !p.is_file() { continue; }
                     let is_image = p.extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|ext| {
@@ -347,22 +350,18 @@ impl App {
                     if !is_image { continue; }
 
                     entries.push(p);
+                    since_last_progress += 1;
 
-                    // Send periodic progress updates for directory opens only —
-                    // file opens already have an image showing, no need to tick.
-                    if !is_file {
-                        since_last_progress += 1;
-                        if since_last_progress >= SCAN_PROGRESS_INTERVAL {
-                            since_last_progress = 0;
-                            let mut snapshot = entries.clone();
-                            snapshot.sort_by(|a, b| {
-                                let an = a.file_name().unwrap_or_default();
-                                let bn = b.file_name().unwrap_or_default();
-                                an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                            });
-                            let _ = scan_tx.send(Ok(snapshot));
-                            let _ = proxy.send_event(AppEvent::ScanProgress);
-                        }
+                    if since_last_progress >= SCAN_PROGRESS_INTERVAL {
+                        since_last_progress = 0;
+                        let mut snapshot = entries.clone();
+                        snapshot.sort_by(|a, b| {
+                            let an = a.file_name().unwrap_or_default();
+                            let bn = b.file_name().unwrap_or_default();
+                            an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+                        });
+                        let _ = scan_tx.send(Ok(snapshot));
+                        let _ = proxy.send_event(AppEvent::ScanProgress);
                     }
                 }
 
