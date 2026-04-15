@@ -26,9 +26,14 @@ pub enum AppEvent {
     DecodeReady,
     /// First image file found during scan — display it immediately.
     StartupFirstFile(PathBuf),
-    /// Full directory scan finished — replace partial list with sorted list.
+    /// Periodic scan progress — partial sorted list available on `scan_rx`.
+    ScanProgress,
+    /// Full directory scan finished — final sorted list available on `scan_rx`.
     ScanComplete,
 }
+
+/// How often (in number of new images found) to send a `ScanProgress` update.
+const SCAN_PROGRESS_INTERVAL: usize = 5;
 
 // Duration for which the mode indicator stays visible before fading.
 const MODE_DISPLAY_SECS: f32 = 5.0;
@@ -303,60 +308,70 @@ impl App {
             .name("startup-scan".into())
             .spawn(move || {
                 let path = path.canonicalize().unwrap_or(path);
-
-                if path.is_file() {
+                let dir = if path.is_file() {
                     // Phase 1: send the file path immediately for display
                     let _ = proxy.send_event(AppEvent::StartupFirstFile(path.clone()));
-
-                    // Phase 2: scan the rest of the directory
-                    let dir = path.parent().unwrap_or(Path::new("."));
-                    let result = scan_directory(dir, &registry);
-                    let _ = scan_tx.send(result);
-                    let _ = proxy.send_event(AppEvent::ScanComplete);
+                    path.parent().unwrap_or(Path::new(".")).to_path_buf()
                 } else {
-                    // Directory open: iterate entries, send the first match
-                    // immediately, then continue scanning for the full list.
-                    let supported = registry.supported_extensions();
-                    let read_dir = match std::fs::read_dir(&path) {
-                        Ok(rd) => rd,
-                        Err(e) => {
-                            let _ = scan_tx.send(Err(e.to_string()));
-                            let _ = proxy.send_event(AppEvent::ScanComplete);
-                            return;
-                        }
-                    };
+                    path
+                };
 
-                    let mut entries = Vec::new();
-                    let mut first_sent = false;
+                // Scan directory with periodic progress updates
+                let supported = registry.supported_extensions();
+                let read_dir = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(e) => {
+                        let _ = scan_tx.send(Err(e.to_string()));
+                        let _ = proxy.send_event(AppEvent::ScanComplete);
+                        return;
+                    }
+                };
 
-                    for entry in read_dir.filter_map(Result::ok) {
-                        let p = entry.path();
-                        if !p.is_file() { continue; }
-                        let is_image = p.extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|ext| {
-                                supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
-                            });
-                        if !is_image { continue; }
+                let mut entries = Vec::new();
+                let mut first_sent = false;
+                let mut since_last_progress: usize = 0;
 
-                        if !first_sent {
-                            let _ = proxy.send_event(
-                                AppEvent::StartupFirstFile(p.clone()),
-                            );
-                            first_sent = true;
-                        }
-                        entries.push(p);
+                for entry in read_dir.filter_map(Result::ok) {
+                    let p = entry.path();
+                    if !p.is_file() { continue; }
+                    let is_image = p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| {
+                            supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
+                        });
+                    if !is_image { continue; }
+
+                    if !first_sent {
+                        let _ = proxy.send_event(
+                            AppEvent::StartupFirstFile(p.clone()),
+                        );
+                        first_sent = true;
                     }
 
-                    entries.sort_by(|a, b| {
-                        let an = a.file_name().unwrap_or_default();
-                        let bn = b.file_name().unwrap_or_default();
-                        an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                    });
+                    entries.push(p);
+                    since_last_progress += 1;
 
-                    let _ = scan_tx.send(Ok(entries));
-                    let _ = proxy.send_event(AppEvent::ScanComplete);
+                    if since_last_progress >= SCAN_PROGRESS_INTERVAL {
+                        since_last_progress = 0;
+                        let mut snapshot = entries.clone();
+                        snapshot.sort_by(|a, b| {
+                            let an = a.file_name().unwrap_or_default();
+                            let bn = b.file_name().unwrap_or_default();
+                            an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+                        });
+                        let _ = scan_tx.send(Ok(snapshot));
+                        let _ = proxy.send_event(AppEvent::ScanProgress);
+                    }
                 }
+
+                entries.sort_by(|a, b| {
+                    let an = a.file_name().unwrap_or_default();
+                    let bn = b.file_name().unwrap_or_default();
+                    an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+                });
+
+                let _ = scan_tx.send(Ok(entries));
+                let _ = proxy.send_event(AppEvent::ScanComplete);
             })
             .expect("failed to spawn startup thread");
     }
@@ -546,33 +561,6 @@ fn clamp_to_screen(window: &Window) {
     if cx != outer_pos.x || cy != outer_pos.y {
         window.set_outer_position(winit::dpi::PhysicalPosition::new(cx, cy));
     }
-}
-
-/// Scan a directory for supported image files (sorted alphabetically).
-/// Returns just the paths — `ImageList` is built on the main thread.
-fn scan_directory(dir: &Path, registry: &PluginRegistry) -> Result<Vec<PathBuf>, String> {
-    let supported = registry.supported_extensions();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|ext| {
-                        supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
-                    })
-        })
-        .collect();
-
-    entries.sort_by(|a, b| {
-        let an = a.file_name().unwrap_or_default();
-        let bn = b.file_name().unwrap_or_default();
-        an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-    });
-
-    Ok(entries)
 }
 
 // ── Overlay UI ────────────────────────────────────────────────────────────────
@@ -1231,37 +1219,47 @@ impl ApplicationHandler<AppEvent> for App {
                 self.load_current();
             }
 
-            AppEvent::ScanComplete => {
-                let result = self.scan_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-                self.scan_rx = None;
-                self.scanning = false;
+            AppEvent::ScanProgress | AppEvent::ScanComplete => {
+                let is_final = matches!(event, AppEvent::ScanComplete);
 
-                if let Some(result) = result {
+                // Drain channel to get the latest snapshot
+                let mut latest = None;
+                if let Some(rx) = self.scan_rx.as_ref() {
+                    while let Ok(result) = rx.try_recv() {
+                        latest = Some(result);
+                    }
+                }
+
+                if is_final {
+                    self.scan_rx = None;
+                    self.scanning = false;
+                }
+
+                if let Some(result) = latest {
                     match result {
                         Ok(entries) => {
-                            if entries.is_empty() {
-                                // No images found during full scan
+                            if entries.is_empty() && is_final {
                                 if self.image_list.is_none() {
                                     log::warn!("no supported images found");
                                     self.status = AppStatus::EmptyFolder;
                                     if let Some(w) = &self.window { w.request_redraw(); }
                                 }
-                            } else {
-                                log::info!("directory scan complete: {} images", entries.len());
+                            } else if !entries.is_empty() {
+                                log::debug!("scan update: {} images{}", entries.len(),
+                                    if is_final { " (final)" } else { "" });
                                 if let Some(list) = self.image_list.as_mut() {
-                                    // Replace partial list with full sorted list
                                     list.replace_entries(entries);
                                 } else {
-                                    // No first file was sent (shouldn't happen, but handle it)
                                     self.image_list = Some(ImageList::from_single(
                                         entries[0].clone(),
                                     ));
                                     self.image_list.as_mut().unwrap().replace_entries(entries);
                                     self.load_current();
                                 }
-                                // Update index display now that we have the real count
                                 self.update_index_display();
-                                self.trigger_prefetch();
+                                if is_final {
+                                    self.trigger_prefetch();
+                                }
                             }
                         }
                         Err(e) => {
@@ -1270,7 +1268,6 @@ impl ApplicationHandler<AppEvent> for App {
                                 self.status = AppStatus::FolderNotFound;
                                 if let Some(w) = &self.window { w.request_redraw(); }
                             }
-                            // If we already have an image showing, keep it
                         }
                     }
                 }
