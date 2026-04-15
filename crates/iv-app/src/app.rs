@@ -5,7 +5,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
     event::{ElementState, KeyEvent, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
 };
@@ -18,6 +18,15 @@ use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
 const APP_NAME: &str = "PikaViewer";
+
+/// Custom events sent to the winit event loop from background threads.
+#[derive(Debug)]
+pub enum AppEvent {
+    /// A background decode (prefetch or current image) completed.
+    DecodeReady,
+    /// The startup directory scan completed.
+    StartupReady,
+}
 
 // Duration for which the mode indicator stays visible before fading.
 const MODE_DISPLAY_SECS: f32 = 5.0;
@@ -75,6 +84,7 @@ pub struct App {
     image_list: Option<ImageList>,
     prefetch:   Option<PrefetchCache>,
     startup_rx: Option<mpsc::Receiver<StartupResult>>,
+    proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
 
     egui_ctx:   egui::Context,
@@ -112,7 +122,11 @@ impl Drop for App {
 }
 
 impl App {
-    pub fn new(start_path: Option<PathBuf>, registry: Arc<PluginRegistry>) -> Self {
+    pub fn new(
+        start_path: Option<PathBuf>,
+        registry: Arc<PluginRegistry>,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Self {
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals {
             window_shadow: egui::epaint::Shadow::NONE,
@@ -130,6 +144,7 @@ impl App {
             image_list: None,
             prefetch:   None,
             startup_rx: None,
+            proxy,
             status:     AppStatus::Ready,
             egui_ctx,
             egui_state: None,
@@ -245,6 +260,7 @@ impl App {
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
 
         let registry = Arc::clone(&self.registry);
+        let proxy = self.proxy.clone();
         let (tx, rx) = mpsc::channel();
         self.startup_rx = Some(rx);
         self.status = AppStatus::Loading;
@@ -259,6 +275,7 @@ impl App {
                     ImageList::from_directory(&path, &registry)
                 };
                 let _ = tx.send(result.map_err(|e| e.to_string()));
+                let _ = proxy.send_event(AppEvent::StartupReady);
             })
             .expect("failed to spawn startup thread");
     }
@@ -877,7 +894,7 @@ fn overlay_label(ui: &mut egui::Ui, text: &str, alpha: u8, font_size: f32) {
 
 // ── winit ApplicationHandler ──────────────────────────────────────────────────
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Use saved window size when in fixed-size mode, otherwise default.
         let initial_size = if self.settings.window.fit_to_image {
@@ -915,10 +932,11 @@ impl ApplicationHandler for App {
         self.renderer   = Some(renderer);
         self.gpu        = Some(gpu);
         self.egui_state = Some(egui_state);
-        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry)));
+        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry), self.proxy.clone()));
 
         if let Some(path) = self.start_path.clone() {
             let registry = Arc::clone(&self.registry);
+            let proxy = self.proxy.clone();
             let (tx, rx) = mpsc::channel();
             self.startup_rx = Some(rx);
             self.status = AppStatus::Loading;
@@ -933,6 +951,7 @@ impl ApplicationHandler for App {
                         ImageList::from_directory(&path, &registry)
                     };
                     let _ = tx.send(result.map_err(|e| e.to_string()));
+                    let _ = proxy.send_event(AppEvent::StartupReady);
                 })
                 .expect("failed to spawn startup thread");
         }
@@ -1120,6 +1139,58 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::StartupReady => {
+                let result = self.startup_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+                if let Some(result) = result {
+                    self.startup_rx = None;
+                    match result {
+                        Ok(list) => {
+                            if list.is_empty() {
+                                log::warn!("no supported images found");
+                                self.status = AppStatus::EmptyFolder;
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            } else {
+                                log::info!("directory scan complete: {} images", list.len());
+                                self.image_list = Some(list);
+                                self.load_current();
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("build image list: {e}");
+                            self.status = AppStatus::FolderNotFound;
+                            if let Some(w) = &self.window { w.request_redraw(); }
+                        }
+                    }
+                }
+            }
+
+            AppEvent::DecodeReady => {
+                let mut current_path_ready: Option<PathBuf> = None;
+                if let Some(ref mut cache) = self.prefetch {
+                    let current_path = self.image_list.as_ref()
+                        .and_then(|l| l.current())
+                        .map(|p| p.to_path_buf());
+
+                    for path in cache.poll_into_cache() {
+                        if current_path.as_ref() == Some(&path) {
+                            cache.waiting_for_current = false;
+                            current_path_ready = Some(path);
+                        }
+                    }
+                }
+                if let Some(path) = current_path_ready {
+                    let entry = self.prefetch.as_mut().and_then(|c| c.get(&path));
+                    if let Some(entry) = entry {
+                        self.apply_cache_entry(path, entry);
+                        self.trigger_prefetch();
+                    }
+                }
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // macOS: pick up files delivered via kAEOpenDocuments Apple Event.
         #[cfg(target_os = "macos")]
@@ -1132,61 +1203,12 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Poll startup thread (directory scan on background thread)
-        if self.startup_rx.is_some() {
-            let result = self.startup_rx.as_ref().unwrap().try_recv().ok();
-            if let Some(result) = result {
-                self.startup_rx = None; // one-shot
-                match result {
-                    Ok(list) => {
-                        if list.is_empty() {
-                            log::warn!("no supported images found");
-                            self.status = AppStatus::EmptyFolder;
-                            if let Some(w) = &self.window { w.request_redraw(); }
-                        } else {
-                            log::info!("directory scan complete: {} images", list.len());
-                            self.image_list = Some(list);
-                            self.load_current();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("build image list: {e}");
-                        self.status = AppStatus::FolderNotFound;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                }
-            }
-        }
-
-        // Poll background decode results — all go into cache.
-        // If the current image was among them, apply it.
-        let mut current_path_ready: Option<PathBuf> = None;
-        if let Some(ref mut cache) = self.prefetch {
-            let current_path = self.image_list.as_ref()
-                .and_then(|l| l.current())
-                .map(|p| p.to_path_buf());
-
-            for path in cache.poll_into_cache() {
-                if current_path.as_ref() == Some(&path) {
-                    cache.waiting_for_current = false;
-                    current_path_ready = Some(path);
-                }
-            }
-        }
-        if let Some(path) = current_path_ready {
-            let entry = self.prefetch.as_mut().and_then(|c| c.get(&path));
-            if let Some(entry) = entry {
-                self.apply_cache_entry(path, entry);
-                self.trigger_prefetch();
-            }
-        }
-
+        // Repaint while mode indicator is fading (time-based animation).
         let needs_repaint = self.mode_changed_at
             .map(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS)
             .unwrap_or(false);
 
-        // Repaint if mode indicator is fading or we're waiting for a decode
-        if needs_repaint || self.status == AppStatus::Loading {
+        if needs_repaint {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }

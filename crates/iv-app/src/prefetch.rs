@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
+use winit::event_loop::EventLoopProxy;
+
 use iv_core::format::{DecodedImage, PluginRegistry};
+
+use crate::app::AppEvent;
 
 // ── EXIF extraction (moved from app.rs so background worker can use it) ─────
 
@@ -133,7 +137,7 @@ pub(crate) struct PrefetchCache {
 }
 
 impl PrefetchCache {
-    pub fn new(registry: Arc<PluginRegistry>) -> Self {
+    pub fn new(registry: Arc<PluginRegistry>, proxy: EventLoopProxy<AppEvent>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<DecodeRequest>();
         let (result_tx, result_rx) = mpsc::channel::<DecodeResult>();
         let generation = Arc::new(AtomicU64::new(0));
@@ -142,7 +146,7 @@ impl PrefetchCache {
         std::thread::Builder::new()
             .name("prefetch-worker".into())
             .spawn(move || {
-                worker_loop(request_rx, result_tx, &registry, &gen_clone);
+                worker_loop(request_rx, result_tx, &registry, &gen_clone, proxy);
             })
             .expect("failed to spawn prefetch worker");
 
@@ -248,6 +252,7 @@ fn worker_loop(
     tx: mpsc::Sender<DecodeResult>,
     registry: &PluginRegistry,
     generation: &AtomicU64,
+    proxy: EventLoopProxy<AppEvent>,
 ) {
     while let Ok(req) = rx.recv() {
         // Skip stale prefetch requests
@@ -272,6 +277,7 @@ fn worker_loop(
                     exif: ExifData::default(),
                     file_size: 0,
                 });
+                let _ = proxy.send_event(AppEvent::DecodeReady);
                 continue;
             }
         };
@@ -299,5 +305,6 @@ fn worker_loop(
             exif,
             file_size,
         });
+        let _ = proxy.send_event(AppEvent::DecodeReady);
     }
 }
