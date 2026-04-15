@@ -259,6 +259,7 @@ mod macos {
 pub use linux::{install, uninstall};
 
 /// Set `PikaViewer` as the default image viewer for the current platform.
+#[allow(clippy::unnecessary_wraps)] // Returns Result on Linux/other, trivial on macOS
 pub fn set_default() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     { linux::set_default() }
