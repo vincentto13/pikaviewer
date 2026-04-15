@@ -54,9 +54,9 @@ impl TransformUniform {
 /// Build the sRGB→linear lookup table (256 entries).
 fn srgb_table() -> [f32; 256] {
     let mut table = [0.0f32; 256];
-    for i in 0..256 {
+    for (i, entry) in table.iter_mut().enumerate() {
         let s = i as f32 / 255.0;
-        table[i] = if s <= 0.04045 {
+        *entry = if s <= 0.04045 {
             s / 12.92
         } else {
             ((s + 0.055) / 1.055).powf(2.4)
