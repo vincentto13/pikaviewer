@@ -49,6 +49,52 @@ impl TransformUniform {
     }
 }
 
+// ── Premultiplied alpha ───────────────────────────────────────────────────────
+
+/// Build the sRGB→linear lookup table (256 entries).
+fn srgb_table() -> [f32; 256] {
+    let mut table = [0.0f32; 256];
+    for i in 0..256 {
+        let s = i as f32 / 255.0;
+        table[i] = if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    table
+}
+
+fn linear_to_srgb_u8(l: f32) -> u8 {
+    let s = if l <= 0.0031308 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+}
+
+/// Premultiply alpha in linear space for correct sRGB blending.
+/// Modifies pixel data in place. Skips fully opaque pixels (the common case).
+fn premultiply_alpha(pixels: &mut [u8]) {
+    let table = srgb_table();
+    for chunk in pixels.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a == 0 {
+            chunk[0] = 0;
+            chunk[1] = 0;
+            chunk[2] = 0;
+        } else if a < 255 {
+            let af = a as f32 / 255.0;
+            chunk[0] = linear_to_srgb_u8(table[chunk[0] as usize] * af);
+            chunk[1] = linear_to_srgb_u8(table[chunk[1] as usize] * af);
+            chunk[2] = linear_to_srgb_u8(table[chunk[2] as usize] * af);
+        }
+    }
+}
+
+// ── Vertex layout ─────────────────────────────────────────────────────────────
+
 /// Build 4 vertices (TL, TR, BL, BR) for a TriangleStrip quad.
 ///
 /// `rotation` is in 90° CW steps (0 = normal, 1 = 90°CW, 2 = 180°, 3 = 270°CW).
@@ -263,7 +309,7 @@ impl Renderer {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend:      Some(wgpu::BlendState::REPLACE),
+                        blend:      Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -313,8 +359,11 @@ impl Renderer {
 
     // ── Public controls ───────────────────────────────────────────────────────
 
-    pub fn set_image(&mut self, image: &DecodedImage) {
+    pub fn set_image(&mut self, image: &mut DecodedImage) {
         self.image_size = Some((image.width, image.height));
+
+        // Premultiply alpha in linear space for correct sRGB blending.
+        premultiply_alpha(&mut image.pixels);
 
         let texture = self.gpu.device.create_texture_with_data(
             &self.gpu.queue,
