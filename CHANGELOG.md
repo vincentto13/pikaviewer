@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.0] - 2026-04-15
+
+### Features
+
+- Zoom and pan — `+`/`-` keys for multiplicative zoom, arrow keys pan when zoomed in, scale percentage shown in overlay
+- Premultiplied alpha blending — correct PNG transparency rendering with sRGB linearize/premultiply pipeline
+- EXIF data panel — camera, lens, exposure, ISO, date taken; shown in image info panel (`I` key)
+- EXIF auto-rotation — reads orientation tag and applies rotation on load
+- Settings saved on exit instead of every resize event
+- EventLoopProxy wakeup — worker threads wake main loop directly, replacing polling
+
+### Refactors
+
+- Extracted `Viewport` struct from `Renderer` for zoom/pan state management
+- Unified coordinate spaces into a single affine transform
+- Introduced `FrameSnapshot` to eliminate `draw_ui` parameter avalanche (12 params → 3)
+- Moved premultiply alpha to worker thread with `LazyLock` LUT
+- `Arc<DecodedImage>` for zero-copy cache sharing; cache entries kept on access
+
+### Fixes
+
+- Fixed PNG transparency rendering (premultiplied alpha blending)
+- Resolved macOS clippy errors (pointer casts, `unnecessary_wraps`)
+- Resolved pedantic clippy warnings across all crates
+
+### Other
+
+- CI now runs on all branches (not just main/dev)
+- Removed `Cargo.lock` from version control
+
 ## [0.2.0] - 2026-04-13
 
 ### Features
