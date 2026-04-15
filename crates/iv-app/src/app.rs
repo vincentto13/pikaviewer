@@ -328,7 +328,6 @@ impl App {
                 };
 
                 let mut entries = Vec::new();
-                let mut first_sent = false;
                 let mut since_last_progress: usize = 0;
 
                 for entry in read_dir.filter_map(Result::ok) {
@@ -340,13 +339,6 @@ impl App {
                             supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
                         });
                     if !is_image { continue; }
-
-                    if !first_sent {
-                        let _ = proxy.send_event(
-                            AppEvent::StartupFirstFile(p.clone()),
-                        );
-                        first_sent = true;
-                    }
 
                     entries.push(p);
                     since_last_progress += 1;
