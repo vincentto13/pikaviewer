@@ -74,7 +74,7 @@ unsafe extern "C" {
 
 fn sel(name: &[u8]) -> *const c_void {
     debug_assert_eq!(*name.last().unwrap(), 0);
-    unsafe { sel_registerName(name.as_ptr() as *const c_char) }
+    unsafe { sel_registerName(name.as_ptr().cast::<c_char>()) }
 }
 
 fn store_path(path: PathBuf) {
@@ -205,7 +205,7 @@ pub(crate) fn register() {
             center,
             sel(b"addObserver:selector:name:object:\0"),
             instance,                                          // observer
-            sel(b"onNotification:\0") as *mut c_void,          // selector
+            sel(b"onNotification:\0").cast_mut(),                // selector
             NSApplicationWillFinishLaunchingNotification,       // name
             std::ptr::null_mut(),                              // object (nil)
         );
