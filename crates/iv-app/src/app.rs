@@ -191,7 +191,7 @@ impl App {
 
     /// Apply a completed decode result: set texture, EXIF rotation, update overlays.
     fn apply_decode_result(&mut self, result: DecodeResult) {
-        let mut image = match result.image {
+        let image = match result.image {
             Ok(img) => img,
             Err(e) => {
                 log::error!("decode {}: {e}", result.path.display());
@@ -218,7 +218,7 @@ impl App {
             exif:      result.exif,
         });
 
-        renderer.set_image(&mut image);
+        renderer.set_image(&image);
         log::debug!("loaded {}×{} {}", image.width, image.height, filename);
 
         let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))

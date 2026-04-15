@@ -52,7 +52,8 @@ fn decode_impl(data: &[u8]) -> Result<DecodedImage, FormatError> {
         out
     };
 
-    Ok(DecodedImage { pixels, width, height })
+    let has_alpha = handle.has_alpha_channel();
+    Ok(DecodedImage { pixels, width, height, has_alpha })
 }
 
 // ── Stub (crate present in graph but libheif not available) ───────────────────

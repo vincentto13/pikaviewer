@@ -21,9 +21,10 @@ impl FormatPlugin for ImageRsPlugin {
     fn decode(&self, data: &[u8]) -> Result<DecodedImage, FormatError> {
         let img = image::load_from_memory(data)
             .map_err(|e| FormatError(e.to_string()))?;
+        let has_alpha = img.color().has_alpha();
         let (width, height) = img.dimensions();
         let pixels = img.into_rgba8().into_raw();
-        Ok(DecodedImage { pixels, width, height })
+        Ok(DecodedImage { pixels, width, height, has_alpha })
     }
 }
 

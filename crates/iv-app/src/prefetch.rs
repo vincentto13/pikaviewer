@@ -276,7 +276,10 @@ fn worker_loop(
             .unwrap_or("");
 
         let image = match registry.find_for_extension(ext) {
-            Some(plugin) => plugin.decode(&data).map_err(|e| e.to_string()),
+            Some(plugin) => plugin.decode(&data).map(|mut img| {
+                img.premultiply_alpha();
+                img
+            }).map_err(|e| e.to_string()),
             None => Err(format!("no plugin for '{ext}'")),
         };
 
