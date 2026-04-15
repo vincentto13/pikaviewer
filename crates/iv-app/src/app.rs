@@ -394,25 +394,22 @@ impl App {
 
         let pixels_per_point = window.scale_factor() as f32;
 
-        // Pre-extract everything the UI closure needs to avoid borrow conflict
-        // with egui_ctx.run() which takes &mut self implicitly via the closure.
-        let filename     = self.current_filename.clone();
-        let index        = self.current_index.clone();
-        let scale_pct    = renderer.image_size.map(|_| (renderer.viewport.scale() * 100.0).round().max(1.0) as u32);
-        let mode_changed = self.mode_changed_at;
-        let mode_label   = renderer.display_mode.label();
-        let show_info    = self.show_info;
-        let image_info   = self.image_info.as_ref();
-
-        let pending_delete = self.pending_delete;
-        let delete_name    = self.current_filename.clone();
-        let show_help      = self.show_help;
-        let status         = self.status;
+        let snap = FrameSnapshot {
+            filename:       self.current_filename.clone(),
+            index:          self.current_index.clone(),
+            scale_pct:      renderer.image_size.map(|_| (renderer.viewport.scale() * 100.0).round().max(1.0) as u32),
+            mode_changed:   self.mode_changed_at,
+            mode_label:     renderer.display_mode.label(),
+            show_info:      self.show_info,
+            pending_delete: self.pending_delete,
+            show_help:      self.show_help,
+            status:         self.status,
+        };
+        let image_info = self.image_info.as_ref();
 
         let raw_input   = egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, &filename, &index, scale_pct, mode_changed, mode_label, show_info,
-                    image_info, pending_delete, &delete_name, show_help, status);
+            draw_ui(ctx, &snap, image_info);
         });
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -471,21 +468,22 @@ fn clamp_to_screen(window: &Window) {
 
 // ── Overlay UI ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-fn draw_ui(
-    ctx:            &egui::Context,
-    filename:       &str,
-    index:          &str,
+/// All overlay state captured once per frame, avoiding parameter threading.
+/// Owns cloned strings because `egui_ctx.run()` borrows `self.egui_ctx`,
+/// preventing the snapshot from holding references to other `self` fields.
+struct FrameSnapshot {
+    filename:       String,
+    index:          String,
     scale_pct:      Option<u32>,
     mode_changed:   Option<Instant>,
-    mode_label:     &str,
+    mode_label:     &'static str,
     show_info:      bool,
-    image_info:     Option<&ImageInfo>,
     pending_delete: bool,
-    delete_name:    &str,
     show_help:      bool,
     status:         AppStatus,
-) {
+}
+
+fn draw_ui(ctx: &egui::Context, snap: &FrameSnapshot, image_info: Option<&ImageInfo>) {
     // Use egui's own screen rect — always correct regardless of DPI scaling.
     let win_w = ctx.screen_rect().width();
 
@@ -496,19 +494,19 @@ fn draw_ui(
     let text_budget = win_w * 0.80 - FRAME_H_MARGIN;
 
     // ── Filename + index — top-left, always visible ───────────────────────────
-    if !filename.is_empty() {
+    if !snap.filename.is_empty() {
         let font_id = egui::FontId::proportional(FONT_FILENAME);
 
         // Reserve pixels for the index + scale suffix " [pos/total] 58%", fit
         // the rest with the filename (truncating from the right with … before extension).
-        let scale_str = scale_pct.map(|p| format!(" {p}%")).unwrap_or_default();
-        let index_suffix = format!("  {index}{scale_str}");
+        let scale_str = snap.scale_pct.map(|p| format!(" {p}%")).unwrap_or_default();
+        let index_suffix = format!("  {}{scale_str}", snap.index);
         let index_w = ctx.fonts(|f| {
             f.layout_no_wrap(index_suffix.clone(), font_id.clone(), egui::Color32::WHITE)
                 .size().x
         });
         let name_budget = (text_budget - index_w).max(0.0);
-        let short_name  = truncate_filename(ctx, filename, &font_id, name_budget);
+        let short_name  = truncate_filename(ctx, &snap.filename, &font_id, name_budget);
         let label_text  = format!("{short_name}{index_suffix}");
 
         egui::Area::new(egui::Id::new("filename_overlay"))
@@ -520,7 +518,7 @@ fn draw_ui(
     }
 
     // ── Mode indicator — top-right, fades after MODE_DISPLAY_SECS ────────────
-    if let Some(changed_at) = mode_changed {
+    if let Some(changed_at) = snap.mode_changed {
         let elapsed = changed_at.elapsed().as_secs_f32();
         if elapsed < MODE_DISPLAY_SECS {
             let alpha = if elapsed < MODE_DISPLAY_SECS - FADE_SECS {
@@ -533,7 +531,7 @@ fn draw_ui(
                 .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
                 .interactable(false)
                 .show(ctx, |ui| {
-                    overlay_label(ui, mode_label, alpha, FONT_MODE);
+                    overlay_label(ui, snap.mode_label, alpha, FONT_MODE);
                 });
 
             ctx.request_repaint();
@@ -541,14 +539,14 @@ fn draw_ui(
     }
 
     // ── Info panel — toggled with I key ──────────────────────────────────────
-    if show_info {
+    if snap.show_info {
         if let Some(info) = image_info {
             draw_info_panel(ctx, info);
         }
     }
 
     // ── Delete confirmation dialog — centred ────────────────────────────────
-    if pending_delete {
+    if snap.pending_delete {
         let frame = egui::Frame {
             fill:         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 240),
             inner_margin: egui::Margin::same(20.0),
@@ -568,7 +566,7 @@ fn draw_ui(
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("Delete \"{delete_name}\"?"))
+                        egui::RichText::new(format!("Delete \"{}\"?", snap.filename))
                             .color(egui::Color32::WHITE)
                             .size(18.0)
                             .strong(),
@@ -584,7 +582,7 @@ fn draw_ui(
     }
 
     // ── Help overlay — centred, lists all shortcuts ─────────────────────────
-    if show_help {
+    if snap.show_help {
         let frame = egui::Frame {
             fill:         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 240),
             inner_margin: egui::Margin::same(20.0),
@@ -668,7 +666,7 @@ fn draw_ui(
     }
 
     // ── Status indicator — centred ─────────────────────────────────────────────
-    let status_text = match status {
+    let status_text = match snap.status {
         AppStatus::Loading       => Some("Loading\u{2026}"),
         AppStatus::EmptyFolder   => Some("No images found"),
         AppStatus::FolderNotFound => Some("Folder not found"),
@@ -681,7 +679,7 @@ fn draw_ui(
             .show(ctx, |ui| {
                 overlay_label(ui, text, 200, 20.0);
             });
-        if status == AppStatus::Loading {
+        if snap.status == AppStatus::Loading {
             ctx.request_repaint();
         }
     }
