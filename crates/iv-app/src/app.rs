@@ -24,8 +24,10 @@ const APP_NAME: &str = "PikaViewer";
 pub enum AppEvent {
     /// A background decode (prefetch or current image) completed.
     DecodeReady,
-    /// The startup directory scan completed.
-    StartupReady,
+    /// First image file found during scan — display it immediately.
+    StartupFirstFile(PathBuf),
+    /// Full directory scan finished — replace partial list with sorted list.
+    ScanComplete,
 }
 
 // Duration for which the mode indicator stays visible before fading.
@@ -67,8 +69,9 @@ enum AppStatus {
     FolderNotFound,
 }
 
-type StartupResult = Result<ImageList, String>;
+type ScanResult = Result<Vec<PathBuf>, String>;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub start_path: Option<PathBuf>,
 
@@ -83,7 +86,8 @@ pub struct App {
     registry:   Arc<PluginRegistry>,
     image_list: Option<ImageList>,
     prefetch:   Option<PrefetchCache>,
-    startup_rx: Option<mpsc::Receiver<StartupResult>>,
+    scan_rx:    Option<mpsc::Receiver<ScanResult>>,
+    scanning:   bool,
     proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
 
@@ -146,7 +150,8 @@ impl App {
             registry,
             image_list: None,
             prefetch:   None,
-            startup_rx: None,
+            scan_rx:    None,
+            scanning:   false,
             proxy,
             status:     AppStatus::Ready,
             egui_ctx,
@@ -165,6 +170,27 @@ impl App {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Format the position index string, showing `…` while scan is in progress.
+    fn format_index(list: &ImageList, scanning: bool) -> String {
+        if scanning {
+            format!("[{}/\u{2026}]", list.position())
+        } else {
+            format!("[{}/{}]", list.position(), list.len())
+        }
+    }
+
+    /// Refresh the index overlay and window title after the scan completes
+    /// and the real count is known.
+    fn update_index_display(&mut self) {
+        let Some(list) = self.image_list.as_ref() else { return };
+        let index = Self::format_index(list, self.scanning);
+        self.current_index.clone_from(&index);
+        if let Some(w) = &self.window {
+            w.set_title(&format!("{APP_NAME} - {} {index}", self.current_filename));
+            w.request_redraw();
+        }
+    }
 
     fn load_current(&mut self) {
         let Some(list) = self.image_list.as_ref() else { return };
@@ -189,7 +215,7 @@ impl App {
             // Update overlay immediately so filename/index reflect the target
             let filename = path.file_name()
                 .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-            let index = format!("[{}/{}]", list.position(), list.len());
+            let index = Self::format_index(list, self.scanning);
             self.current_filename.clone_from(&filename);
             self.current_index.clone_from(&index);
             if let Some(w) = &self.window {
@@ -222,7 +248,8 @@ impl App {
         renderer.set_image(&entry.image);
         log::debug!("loaded {}×{} {}", entry.image.width, entry.image.height, filename);
 
-        let index = list.map(|l| format!("[{}/{}]", l.position(), l.len()))
+        let scanning = self.scanning;
+        let index = list.map(|l| Self::format_index(l, scanning))
             .unwrap_or_default();
         self.current_filename.clone_from(&filename);
         self.current_index.clone_from(&index);
@@ -259,24 +286,77 @@ impl App {
     fn load_path(&mut self, path: PathBuf) {
         if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
         if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
+        self.start_progressive_scan(path);
+    }
 
+    /// Start a two-phase progressive scan: show the first image immediately,
+    /// then scan the full directory in the background.
+    fn start_progressive_scan(&mut self, path: PathBuf) {
         let registry = Arc::clone(&self.registry);
         let proxy = self.proxy.clone();
-        let (tx, rx) = mpsc::channel();
-        self.startup_rx = Some(rx);
+        let (scan_tx, scan_rx) = mpsc::channel();
+        self.scan_rx = Some(scan_rx);
+        self.scanning = true;
         self.status = AppStatus::Loading;
 
         std::thread::Builder::new()
             .name("startup-scan".into())
             .spawn(move || {
                 let path = path.canonicalize().unwrap_or(path);
-                let result = if path.is_file() {
-                    ImageList::from_file(&path, &registry)
+
+                if path.is_file() {
+                    // Phase 1: send the file path immediately for display
+                    let _ = proxy.send_event(AppEvent::StartupFirstFile(path.clone()));
+
+                    // Phase 2: scan the rest of the directory
+                    let dir = path.parent().unwrap_or(Path::new("."));
+                    let result = scan_directory(dir, &registry);
+                    let _ = scan_tx.send(result);
+                    let _ = proxy.send_event(AppEvent::ScanComplete);
                 } else {
-                    ImageList::from_directory(&path, &registry)
-                };
-                let _ = tx.send(result.map_err(|e| e.to_string()));
-                let _ = proxy.send_event(AppEvent::StartupReady);
+                    // Directory open: iterate entries, send the first match
+                    // immediately, then continue scanning for the full list.
+                    let supported = registry.supported_extensions();
+                    let read_dir = match std::fs::read_dir(&path) {
+                        Ok(rd) => rd,
+                        Err(e) => {
+                            let _ = scan_tx.send(Err(e.to_string()));
+                            let _ = proxy.send_event(AppEvent::ScanComplete);
+                            return;
+                        }
+                    };
+
+                    let mut entries = Vec::new();
+                    let mut first_sent = false;
+
+                    for entry in read_dir.filter_map(Result::ok) {
+                        let p = entry.path();
+                        if !p.is_file() { continue; }
+                        let is_image = p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|ext| {
+                                supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
+                            });
+                        if !is_image { continue; }
+
+                        if !first_sent {
+                            let _ = proxy.send_event(
+                                AppEvent::StartupFirstFile(p.clone()),
+                            );
+                            first_sent = true;
+                        }
+                        entries.push(p);
+                    }
+
+                    entries.sort_by(|a, b| {
+                        let an = a.file_name().unwrap_or_default();
+                        let bn = b.file_name().unwrap_or_default();
+                        an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+                    });
+
+                    let _ = scan_tx.send(Ok(entries));
+                    let _ = proxy.send_event(AppEvent::ScanComplete);
+                }
             })
             .expect("failed to spawn startup thread");
     }
@@ -466,6 +546,33 @@ fn clamp_to_screen(window: &Window) {
     if cx != outer_pos.x || cy != outer_pos.y {
         window.set_outer_position(winit::dpi::PhysicalPosition::new(cx, cy));
     }
+}
+
+/// Scan a directory for supported image files (sorted alphabetically).
+/// Returns just the paths — `ImageList` is built on the main thread.
+fn scan_directory(dir: &Path, registry: &PluginRegistry) -> Result<Vec<PathBuf>, String> {
+    let supported = registry.supported_extensions();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
+                    })
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        let an = a.file_name().unwrap_or_default();
+        let bn = b.file_name().unwrap_or_default();
+        an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
+    });
+
+    Ok(entries)
 }
 
 // ── Overlay UI ────────────────────────────────────────────────────────────────
@@ -934,25 +1041,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry), self.proxy.clone()));
 
         if let Some(path) = self.start_path.clone() {
-            let registry = Arc::clone(&self.registry);
-            let proxy = self.proxy.clone();
-            let (tx, rx) = mpsc::channel();
-            self.startup_rx = Some(rx);
-            self.status = AppStatus::Loading;
-
-            std::thread::Builder::new()
-                .name("startup-scan".into())
-                .spawn(move || {
-                    let path = path.canonicalize().unwrap_or(path);
-                    let result = if path.is_file() {
-                        ImageList::from_file(&path, &registry)
-                    } else {
-                        ImageList::from_directory(&path, &registry)
-                    };
-                    let _ = tx.send(result.map_err(|e| e.to_string()));
-                    let _ = proxy.send_event(AppEvent::StartupReady);
-                })
-                .expect("failed to spawn startup thread");
+            self.start_progressive_scan(path);
         }
     }
 
@@ -1135,26 +1224,53 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::StartupReady => {
-                let result = self.startup_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            AppEvent::StartupFirstFile(path) => {
+                // Phase 1: show the first image immediately with a single-entry list
+                log::info!("first file ready: {}", path.display());
+                self.image_list = Some(ImageList::from_single(path));
+                self.load_current();
+            }
+
+            AppEvent::ScanComplete => {
+                let result = self.scan_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+                self.scan_rx = None;
+                self.scanning = false;
+
                 if let Some(result) = result {
-                    self.startup_rx = None;
                     match result {
-                        Ok(list) => {
-                            if list.is_empty() {
-                                log::warn!("no supported images found");
-                                self.status = AppStatus::EmptyFolder;
-                                if let Some(w) = &self.window { w.request_redraw(); }
+                        Ok(entries) => {
+                            if entries.is_empty() {
+                                // No images found during full scan
+                                if self.image_list.is_none() {
+                                    log::warn!("no supported images found");
+                                    self.status = AppStatus::EmptyFolder;
+                                    if let Some(w) = &self.window { w.request_redraw(); }
+                                }
                             } else {
-                                log::info!("directory scan complete: {} images", list.len());
-                                self.image_list = Some(list);
-                                self.load_current();
+                                log::info!("directory scan complete: {} images", entries.len());
+                                if let Some(list) = self.image_list.as_mut() {
+                                    // Replace partial list with full sorted list
+                                    list.replace_entries(entries);
+                                } else {
+                                    // No first file was sent (shouldn't happen, but handle it)
+                                    self.image_list = Some(ImageList::from_single(
+                                        entries[0].clone(),
+                                    ));
+                                    self.image_list.as_mut().unwrap().replace_entries(entries);
+                                    self.load_current();
+                                }
+                                // Update index display now that we have the real count
+                                self.update_index_display();
+                                self.trigger_prefetch();
                             }
                         }
                         Err(e) => {
-                            log::error!("build image list: {e}");
-                            self.status = AppStatus::FolderNotFound;
-                            if let Some(w) = &self.window { w.request_redraw(); }
+                            log::error!("directory scan failed: {e}");
+                            if self.image_list.is_none() {
+                                self.status = AppStatus::FolderNotFound;
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            }
+                            // If we already have an image showing, keep it
                         }
                     }
                 }
