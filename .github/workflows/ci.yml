@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -9,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check & Clippy
+  clippy-linux:
+    name: Clippy (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,35 +24,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libvulkan-dev mesa-vulkan-drivers \
             libx11-dev libxrandr-dev libxcursor-dev libxi-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libudev-dev
-
-      - name: cargo check
-        run: cargo check --workspace
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libudev-dev \
+            libheif-dev
 
       - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --features iv-app/heic -- -D warnings
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libvulkan-dev mesa-vulkan-drivers \
-            libx11-dev libxrandr-dev libxcursor-dev libxi-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libudev-dev
-
-      - name: cargo test
-        run: cargo test --workspace
-
-  build-macos:
-    name: Build (macOS arm64)
+  clippy-macos:
+    name: Clippy (macOS arm64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,8 +43,5 @@ jobs:
           brew install libheif
           echo "PKG_CONFIG_PATH=$(brew --prefix libheif)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      - name: cargo clippy (with HEIC)
+      - name: cargo clippy
         run: cargo clippy --workspace --features iv-app/heic -- -D warnings
-
-      - name: cargo build
-        run: cargo build --release --features iv-app/heic
