@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.1] - 2026-04-16
+
+### Features
+
+- Mouse scroll-to-zoom — mouse wheel and two-finger trackpad scroll zoom in/out (Linux + macOS)
+- macOS pinch-to-zoom — native `PinchGesture` support
+- Click-drag pan — left-click hold + drag to pan when zoomed in
+- Progressive directory scan — first image shown immediately, directory scanned in background for fast startup on slow/network drives
+
+### Other
+
+- CI runs on push to all branches (not just main)
+- CI simplified to clippy-only (Linux + macOS)
+- Website deployment triggered automatically on release
+
 ## [0.3.0] - 2026-04-15
 
 ### Features

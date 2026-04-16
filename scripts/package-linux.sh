@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
