@@ -20,21 +20,27 @@ impl ImageList {
         Ok(list)
     }
 
+    /// Create a single-entry list for immediate display before the full
+    /// directory scan completes.
+    pub fn from_single(path: PathBuf) -> Self {
+        Self { entries: vec![path], current: 0 }
+    }
+
     /// Build a list from all supported images in `dir`, sorted alphabetically.
     pub fn from_directory(dir: &Path, registry: &PluginRegistry) -> io::Result<Self> {
         let supported = registry.supported_extensions();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
             .filter(|p| {
-                p.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| {
-                            supported
-                                .iter()
-                                .any(|s| s.eq_ignore_ascii_case(ext))
-                        })
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        supported
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(ext))
+                    })
             })
             .collect();
 
@@ -45,6 +51,16 @@ impl ImageList {
         });
 
         Ok(Self { entries, current: 0 })
+    }
+
+    /// Replace the entry list with a fully scanned and sorted list,
+    /// repositioning the cursor at the same file if it exists in the new list.
+    pub fn replace_entries(&mut self, entries: Vec<PathBuf>) {
+        let current_path = self.current().map(Path::to_path_buf);
+        self.entries = entries;
+        self.current = current_path
+            .and_then(|p| self.entries.iter().position(|e| e == &p))
+            .unwrap_or(0);
     }
 
     #[must_use]
