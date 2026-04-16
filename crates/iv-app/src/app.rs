@@ -3,8 +3,8 @@ use std::{path::{Path, PathBuf}, sync::{mpsc, Arc}, time::Instant};
 use anyhow::Result;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, KeyEvent, WindowEvent},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
@@ -53,6 +53,8 @@ const MIN_WINDOW_H: u32 = 450;
 // Zoom / pan
 const ZOOM_STEP: f32 = 1.25;   // multiply / divide per keypress
 const PAN_STEP:  f32 = 0.1;    // NDC per press (divided by zoom → constant pixel movement)
+const SCROLL_SENSITIVITY: f64 = 0.1; // zoom factor per scroll line
+const PIXELS_PER_LINE: f64 = 40.0;   // trackpad pixel-delta → line conversion
 
 // ── Image info ───────────────────────────────────────────────────────────────
 
@@ -113,6 +115,10 @@ pub struct App {
     show_help:      bool,
 
     modifiers: ModifiersState,
+
+    // Mouse drag state
+    drag_origin: Option<PhysicalPosition<f64>>,
+    last_cursor: PhysicalPosition<f64>,
 }
 
 impl Drop for App {
@@ -172,6 +178,8 @@ impl App {
             pending_delete:   false,
             show_help:        false,
             modifiers:        ModifiersState::default(),
+            drag_origin:      None,
+            last_cursor:      PhysicalPosition::new(0.0, 0.0),
         }
     }
 
@@ -1214,6 +1222,58 @@ impl ApplicationHandler<AppEvent> for App {
                 _ => {}
                 } // match logical_key
             },
+
+            // ── Mouse zoom ────────────────────────────────────────────────
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines_y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / PIXELS_PER_LINE,
+                };
+                if lines_y != 0.0 {
+                    let factor = (1.0 + lines_y * SCROLL_SENSITIVITY) as f32;
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.viewport.set_zoom(r.viewport.zoom() * factor);
+                    }
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+
+            // macOS trackpad pinch-to-zoom
+            WindowEvent::PinchGesture { delta, .. } => {
+                if delta != 0.0 {
+                    let factor = (1.0 + delta) as f32;
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.viewport.set_zoom(r.viewport.zoom() * factor);
+                    }
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+
+            // ── Mouse drag-to-pan ────────────────────────────────────────────
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                self.drag_origin = Some(self.last_cursor);
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. }
+            | WindowEvent::CursorLeft { .. } => {
+                self.drag_origin = None;
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.drag_origin.is_some() {
+                    let delta_x = position.x - self.last_cursor.x;
+                    let delta_y = position.y - self.last_cursor.y;
+                    if let Some(w) = &self.window {
+                        let size = w.inner_size();
+                        let pan_x = (delta_x / f64::from(size.width)  *  2.0) as f32;
+                        let pan_y = (delta_y / f64::from(size.height) * -2.0) as f32;
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.viewport.adjust_pan(pan_x, pan_y);
+                        }
+                        w.request_redraw();
+                    }
+                }
+                self.last_cursor = position;
+            }
 
             _ => {}
         }
