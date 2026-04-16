@@ -31,7 +31,10 @@ pub enum AppEvent {
 }
 
 /// How often (in number of new images found) to send a `ScanProgress` update.
-const SCAN_PROGRESS_INTERVAL: usize = 1;
+/// Kept low for responsiveness on slow drives; each update clones + sorts the
+/// entries found so far, so O(n²) total — acceptable for typical directories
+/// (< 10 000 images) but would need batching for huge collections.
+const SCAN_PROGRESS_INTERVAL: usize = 10;
 
 // Duration for which the mode indicator stays visible before fading.
 const MODE_DISPLAY_SECS: f32 = 5.0;
@@ -295,6 +298,10 @@ impl App {
     /// Start a two-phase progressive scan: show the first image immediately,
     /// then scan the full directory in the background.
     fn start_progressive_scan(&mut self, path: PathBuf) {
+        // Drop any previous scan's receiver so stale messages are discarded.
+        // The old thread's send() will fail silently (we ignore send errors).
+        self.scan_rx = None;
+
         let registry = Arc::clone(&self.registry);
         let proxy = self.proxy.clone();
         let (scan_tx, scan_rx) = mpsc::channel();
