@@ -24,11 +24,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libvulkan-dev mesa-vulkan-drivers \
             libx11-dev libxrandr-dev libxcursor-dev libxi-dev libxxf86vm-dev \
-            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libudev-dev \
-            libheif-dev
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libudev-dev
 
+      # HEIC feature skipped: Ubuntu's libheif (1.17) is too old for
+      # libheif-sys (requires >= 1.18). The HEIC crate has no platform-
+      # specific code, so macOS CI covers it with Homebrew's newer libheif.
       - name: cargo clippy
-        run: cargo clippy --workspace --features iv-app/heic -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
   clippy-macos:
     name: Clippy (macOS arm64)
