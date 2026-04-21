@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use winit::event_loop::EventLoopProxy;
+
+/// Number of prefetch worker threads. With >1, N+1 and N-1 can decode in
+/// parallel so backward navigation is pre-warmed even while the forward
+/// prefetch is still running.
+const WORKER_COUNT: usize = 2;
 
 use iv_core::format::{DecodedImage, PluginRegistry};
 
@@ -138,16 +143,23 @@ pub(crate) struct PrefetchCache {
 impl PrefetchCache {
     pub fn new(registry: Arc<PluginRegistry>, proxy: EventLoopProxy<AppEvent>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<DecodeRequest>();
+        let request_rx = Arc::new(Mutex::new(request_rx));
         let (result_tx, result_rx) = mpsc::channel::<DecodeResult>();
         let generation = Arc::new(AtomicU64::new(0));
-        let gen_clone = Arc::clone(&generation);
 
-        std::thread::Builder::new()
-            .name("prefetch-worker".into())
-            .spawn(move || {
-                worker_loop(request_rx, result_tx, &registry, &gen_clone, proxy);
-            })
-            .expect("failed to spawn prefetch worker");
+        for i in 0..WORKER_COUNT {
+            let rx      = Arc::clone(&request_rx);
+            let tx      = result_tx.clone();
+            let reg     = Arc::clone(&registry);
+            let gen     = Arc::clone(&generation);
+            let proxy_i = proxy.clone();
+            std::thread::Builder::new()
+                .name(format!("prefetch-worker-{i}"))
+                .spawn(move || {
+                    worker_loop(&rx, &tx, &reg, &gen, &proxy_i);
+                })
+                .expect("failed to spawn prefetch worker");
+        }
 
         Self {
             cache: HashMap::new(),
@@ -247,13 +259,23 @@ impl PrefetchCache {
 }
 
 fn worker_loop(
-    rx: mpsc::Receiver<DecodeRequest>,
-    tx: mpsc::Sender<DecodeResult>,
+    rx: &Mutex<mpsc::Receiver<DecodeRequest>>,
+    tx: &mpsc::Sender<DecodeResult>,
     registry: &PluginRegistry,
     generation: &AtomicU64,
-    proxy: EventLoopProxy<AppEvent>,
+    proxy: &EventLoopProxy<AppEvent>,
 ) {
-    while let Ok(req) = rx.recv() {
+    loop {
+        // Scope the lock so we hold it only across recv(); the decode below
+        // must NOT hold it, otherwise workers wouldn't actually run in parallel.
+        let req = {
+            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.recv() {
+                Ok(r) => r,
+                Err(_) => return, // sender dropped — shut down
+            }
+        };
+
         // Skip stale prefetch requests
         let current_gen = generation.load(Ordering::Relaxed);
         if req.generation < current_gen {

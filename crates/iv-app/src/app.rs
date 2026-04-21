@@ -14,6 +14,7 @@ use iv_core::{format::PluginRegistry, image_list::ImageList};
 use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
+use crate::dir_watcher::DirWatcher;
 use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
@@ -28,6 +29,8 @@ pub enum AppEvent {
     ScanProgress,
     /// Full directory scan finished — final sorted list available on `scan_rx`.
     ScanComplete,
+    /// A watched directory changed on disk — debounced by `DirWatcher`.
+    DirChanged,
 }
 
 /// How often (in number of new images found) to send a `ScanProgress` update.
@@ -96,6 +99,7 @@ pub struct App {
     prefetch:   Option<PrefetchCache>,
     scan_rx:    Option<mpsc::Receiver<ScanResult>>,
     scanning:   bool,
+    dir_watcher: Option<DirWatcher>,
     proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
 
@@ -164,6 +168,7 @@ impl App {
             prefetch:   None,
             scan_rx:    None,
             scanning:   false,
+            dir_watcher: None,
             proxy,
             status:     AppStatus::Ready,
             egui_ctx,
@@ -306,6 +311,58 @@ impl App {
     /// Start a two-phase progressive scan: show the first image immediately,
     /// then scan the full directory in the background.
     fn start_progressive_scan(&mut self, path: PathBuf) {
+        // For file opens, show the image immediately on the main thread —
+        // no event round-trip, so no race with the scan thread.
+        let canonical = path.canonicalize().unwrap_or(path);
+        let is_file = canonical.is_file();
+        let dir = if is_file {
+            canonical.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            canonical.clone()
+        };
+
+        if is_file {
+            self.image_list = Some(ImageList::from_single(canonical));
+            self.load_current();
+        } else {
+            self.status = AppStatus::Loading;
+        }
+
+        self.install_dir_watcher(&dir);
+        self.spawn_scan_thread(dir);
+    }
+
+    /// Re-scan the directory of the currently displayed image without touching
+    /// the existing image list or status — used when `DirWatcher` reports a
+    /// change. The existing `replace_entries` code path then reconciles.
+    fn rescan_current_dir(&mut self) {
+        let Some(dir) = self.current_dir() else { return };
+        log::debug!("rescanning {} after dir change", dir.display());
+        self.spawn_scan_thread(dir);
+    }
+
+    /// Directory of the currently displayed image (or the scanned directory
+    /// if no image is loaded yet).
+    fn current_dir(&self) -> Option<PathBuf> {
+        if let Some(w) = self.dir_watcher.as_ref() {
+            return Some(w.dir().to_path_buf());
+        }
+        self.image_list.as_ref()
+            .and_then(|l| l.current())
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    fn install_dir_watcher(&mut self, dir: &Path) {
+        // Drop the old watcher first so its debounce thread stops before we
+        // start a new one — prevents stray events from a previous directory.
+        self.dir_watcher = None;
+        match DirWatcher::new(dir, &self.registry, self.proxy.clone()) {
+            Ok(w)  => self.dir_watcher = Some(w),
+            Err(e) => log::warn!("dir watcher failed for {}: {e}", dir.display()),
+        }
+    }
+
+    fn spawn_scan_thread(&mut self, dir: PathBuf) {
         // Drop any previous scan's receiver so stale messages are discarded.
         // The old thread's send() will fail silently (we ignore send errors).
         self.scan_rx = None;
@@ -316,27 +373,9 @@ impl App {
         self.scan_rx = Some(scan_rx);
         self.scanning = true;
 
-        // For file opens, show the image immediately on the main thread —
-        // no event round-trip, so no race with the scan thread.
-        let canonical = path.canonicalize().unwrap_or(path);
-        let is_file = canonical.is_file();
-        if is_file {
-            self.image_list = Some(ImageList::from_single(canonical.clone()));
-            self.load_current();
-        } else {
-            self.status = AppStatus::Loading;
-        }
-
-        let path = canonical;
         std::thread::Builder::new()
-            .name("startup-scan".into())
+            .name("dir-scan".into())
             .spawn(move || {
-                let dir = if is_file {
-                    path.parent().unwrap_or(Path::new(".")).to_path_buf()
-                } else {
-                    path
-                };
-
                 // Scan directory
                 let supported = registry.supported_extensions();
                 let read_dir = match std::fs::read_dir(&dir) {
@@ -390,7 +429,7 @@ impl App {
                 let _ = scan_tx.send(Ok(entries));
                 let _ = proxy.send_event(AppEvent::ScanComplete);
             })
-            .expect("failed to spawn startup thread");
+            .expect("failed to spawn scan thread");
     }
 
     fn navigate(&mut self, delta: i64) {
@@ -1336,6 +1375,10 @@ impl ApplicationHandler<AppEvent> for App {
                     // No new data but scan finished — refresh index to drop the `…`
                     self.update_index_display();
                 }
+            }
+
+            AppEvent::DirChanged => {
+                self.rescan_current_dir();
             }
 
             AppEvent::DecodeReady => {

@@ -32,3 +32,4 @@ toml        = { workspace = true }
 dirs        = { workspace = true }
 wgpu        = { workspace = true }
 kamadak-exif = { workspace = true }
+notify      = { workspace = true }
