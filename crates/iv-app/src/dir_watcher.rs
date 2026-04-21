@@ -41,15 +41,10 @@ impl DirWatcher {
         })?;
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
 
-        let supported: Vec<String> = registry
-            .supported_extensions()
-            .iter()
-            .map(|s| (*s).to_ascii_lowercase())
-            .collect();
-
+        let registry = Arc::clone(registry);
         std::thread::Builder::new()
             .name("dir-watcher-debounce".into())
-            .spawn(move || debounce_loop(&event_rx, &stop_rx, &supported, &proxy))
+            .spawn(move || debounce_loop(&event_rx, &stop_rx, &registry, &proxy))
             .expect("failed to spawn dir-watcher thread");
 
         Ok(Self { _watcher: watcher, stop_tx, dir: dir.to_path_buf() })
@@ -67,7 +62,7 @@ impl Drop for DirWatcher {
 fn debounce_loop(
     event_rx: &mpsc::Receiver<notify::Event>,
     stop_rx:  &mpsc::Receiver<()>,
-    supported: &[String],
+    registry: &PluginRegistry,
     proxy:    &EventLoopProxy<AppEvent>,
 ) {
     let mut pending_since: Option<Instant> = None;
@@ -77,7 +72,7 @@ fn debounce_loop(
 
         match event_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => {
-                if is_relevant(&event, supported) {
+                if is_relevant(&event, registry) {
                     pending_since = Some(Instant::now());
                 }
             }
@@ -94,7 +89,7 @@ fn debounce_loop(
     }
 }
 
-fn is_relevant(event: &notify::Event, supported: &[String]) -> bool {
+fn is_relevant(event: &notify::Event, registry: &PluginRegistry) -> bool {
     // Only react to events that can change the directory listing. Modify
     // events on existing files don't affect the list of supported images.
     let structural = matches!(
@@ -102,13 +97,5 @@ fn is_relevant(event: &notify::Event, supported: &[String]) -> bool {
         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
     );
     if !structural { return false; }
-
-    event.paths.iter().any(|p| {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| {
-                let ext = ext.to_ascii_lowercase();
-                supported.iter().any(|s| s == &ext)
-            })
-    })
+    event.paths.iter().any(|p| registry.supports_path(p))
 }

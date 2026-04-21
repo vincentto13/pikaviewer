@@ -237,8 +237,7 @@ impl App {
             self.status = AppStatus::Loading;
 
             // Update overlay immediately so filename/index reflect the target
-            let filename = path.file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let filename = display_filename(&path);
             let index = Self::format_index(list, self.scanning);
             self.current_filename.clone_from(&filename);
             self.current_index.clone_from(&index);
@@ -257,9 +256,7 @@ impl App {
 
         renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
 
-        let filename = path
-            .file_name()
-            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let filename = display_filename(&path);
 
         self.image_info = Some(ImageInfo {
             width:     entry.image.width,
@@ -331,7 +328,12 @@ impl App {
             self.image_list = Some(ImageList::from_single(entries[0].clone()));
         }
 
-        let anchor_found = self.image_list.as_mut().unwrap()
+        // Anchor-deletion cleanup (displayed file missing from new list) is
+        // NOT done here: the final scan snapshot frequently piggybacks onto
+        // a `ScanProgress` event when the channel drain catches both at once,
+        // so `is_final` is unreliable at this point. The check runs once at
+        // `ScanComplete` via `finalize_anchor_check`.
+        self.image_list.as_mut().unwrap()
             .replace_entries(entries, anchor.as_deref());
 
         if bootstrap {
@@ -342,12 +344,6 @@ impl App {
                 .and_then(|l| l.current())
                 .map(Path::to_path_buf);
         }
-        // Anchor-deletion cleanup (displayed file missing from new list) is
-        // NOT done here: the final scan snapshot frequently piggybacks onto
-        // a `ScanProgress` event when the channel drain catches both at once,
-        // so `is_final` is unreliable at this point. The check runs once at
-        // `ScanComplete` via `finalize_anchor_check`.
-        let _ = anchor_found;
 
         self.update_index_display();
         if is_final {
@@ -372,9 +368,7 @@ impl App {
         }
         self.image_info = None;
         if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
-            let filename = path.file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-            self.current_filename.clone_from(&filename);
+            self.current_filename = display_filename(path);
         }
         if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
         self.load_current();
@@ -481,8 +475,6 @@ impl App {
         std::thread::Builder::new()
             .name("dir-scan".into())
             .spawn(move || {
-                // Scan directory
-                let supported = registry.supported_extensions();
                 let read_dir = match std::fs::read_dir(&dir) {
                     Ok(rd) => rd,
                     Err(e) => {
@@ -498,15 +490,9 @@ impl App {
                 for entry in read_dir.filter_map(Result::ok) {
                     // Use file_type() from DirEntry (cached from readdir, no
                     // extra stat syscall) — critical on slow network drives.
-                    let is_file = entry.file_type().is_ok_and(|ft| ft.is_file());
-                    if !is_file { continue; }
+                    if !entry.file_type().is_ok_and(|ft| ft.is_file()) { continue; }
                     let p = entry.path();
-                    let is_image = p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| {
-                            supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
-                        });
-                    if !is_image { continue; }
+                    if !registry.supports_path(&p) { continue; }
 
                     entries.push(p);
                     since_last_progress += 1;
@@ -514,23 +500,13 @@ impl App {
                     if since_last_progress >= SCAN_PROGRESS_INTERVAL {
                         since_last_progress = 0;
                         let mut snapshot = entries.clone();
-                        snapshot.sort_by(|a, b| {
-                            let an = a.file_name().unwrap_or_default();
-                            let bn = b.file_name().unwrap_or_default();
-                            an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                        });
+                        sort_by_filename(&mut snapshot);
                         let _ = scan_tx.send(Ok(snapshot));
                         let _ = proxy.send_event(AppEvent::ScanProgress);
                     }
                 }
 
-                // Final sorted list
-                entries.sort_by(|a, b| {
-                    let an = a.file_name().unwrap_or_default();
-                    let bn = b.file_name().unwrap_or_default();
-                    an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                });
-
+                sort_by_filename(&mut entries);
                 let _ = scan_tx.send(Ok(entries));
                 let _ = proxy.send_event(AppEvent::ScanComplete);
             })
@@ -630,17 +606,7 @@ impl App {
         if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
 
         if list.is_empty() {
-            // No images left — clear the display
-            if let Some(r) = self.renderer.as_mut() {
-                r.clear_image();
-            }
-            self.current_filename.clear();
-            self.current_index.clear();
-            self.image_info = None;
-            if let Some(w) = &self.window {
-                w.set_title(APP_NAME);
-                w.request_redraw();
-            }
+            self.clear_display_for_empty();
         } else {
             self.load_current();
         }
@@ -690,6 +656,26 @@ impl App {
 
         renderer.render(&paint_jobs, &full_output.textures_delta, &screen_desc)
     }
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+/// Short label for `path` suitable for overlays and titles: the bare filename,
+/// falling back to the full display string for paths with no terminal name
+/// component (e.g. `/`).
+fn display_filename(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Sort `entries` by filename, case-insensitive. Uses `sort_by_cached_key`
+/// so each filename is lowercased once (O(n)) rather than once per
+/// comparison (O(n log n) allocations) — matters for large directories
+/// during progressive scans, which re-sort on every partial snapshot.
+fn sort_by_filename(entries: &mut [PathBuf]) {
+    entries.sort_by_cached_key(|p| {
+        p.file_name().unwrap_or_default().to_ascii_lowercase()
+    });
 }
 
 // ── Window helpers ────────────────────────────────────────────────────────────
