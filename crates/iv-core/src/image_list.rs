@@ -54,17 +54,39 @@ impl ImageList {
     }
 
     /// Replace the entry list with a fully scanned and sorted list,
-    /// repositioning the cursor at `anchor` if it exists in the new list.
+    /// repositioning the cursor relative to `anchor`. Returns `true` if
+    /// `anchor` was located in the new list.
+    ///
+    /// When `anchor` is missing (e.g. the displayed file was deleted on
+    /// disk), the cursor is moved to the first entry that sorts *after*
+    /// `anchor` — the file the user would see by pressing Next. If no
+    /// successor exists, the cursor lands on the last entry. With no
+    /// anchor at all, the cursor is clamped into range without moving.
     ///
     /// The caller is responsible for supplying a stable anchor — using
-    /// `self.current()` here would be unsafe during progressive scans,
-    /// because if `anchor` is missing from a partial snapshot the cursor
-    /// resets to 0 and a subsequent call would anchor on the wrong file.
-    pub fn replace_entries(&mut self, entries: Vec<PathBuf>, anchor: Option<&Path>) {
+    /// `self.current()` here would be unsafe during progressive scans
+    /// because partial snapshots missing the anchor would drift the
+    /// cursor before the full list arrives.
+    pub fn replace_entries(&mut self, entries: Vec<PathBuf>, anchor: Option<&Path>) -> bool {
         self.entries = entries;
-        self.current = anchor
-            .and_then(|p| self.entries.iter().position(|e| e == p))
-            .unwrap_or(0);
+        if let Some(anchor) = anchor {
+            if let Some(pos) = self.entries.iter().position(|e| e == anchor) {
+                self.current = pos;
+                return true;
+            }
+            let anchor_key = anchor.file_name().unwrap_or_default().to_ascii_lowercase();
+            let successor = self.entries.iter().position(|e| {
+                e.file_name().unwrap_or_default().to_ascii_lowercase() > anchor_key
+            });
+            self.current = successor
+                .or_else(|| self.entries.len().checked_sub(1))
+                .unwrap_or(0);
+            return false;
+        }
+        if self.current >= self.entries.len() {
+            self.current = self.entries.len().saturating_sub(1);
+        }
+        false
     }
 
     #[must_use]

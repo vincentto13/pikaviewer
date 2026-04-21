@@ -304,6 +304,78 @@ impl App {
         }
     }
 
+    /// React to a scan-thread snapshot. Preserves the displayed image when
+    /// `scan_anchor` is still present, reloads a neighbour when the anchor
+    /// has been deleted on disk, and clears the display when no supported
+    /// images remain.
+    fn apply_scan_update(&mut self, entries: Vec<PathBuf>, is_final: bool) {
+        if entries.is_empty() {
+            if is_final {
+                if self.image_list.is_some() {
+                    self.clear_display_for_empty();
+                } else {
+                    log::warn!("no supported images found");
+                    self.status = AppStatus::EmptyFolder;
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+            return;
+        }
+
+        log::debug!("scan update: {} images{}", entries.len(),
+            if is_final { " (final)" } else { "" });
+
+        let anchor = self.scan_anchor.clone();
+        let bootstrap = self.image_list.is_none();
+        if bootstrap {
+            self.image_list = Some(ImageList::from_single(entries[0].clone()));
+        }
+
+        let anchor_found = self.image_list.as_mut().unwrap()
+            .replace_entries(entries, anchor.as_deref());
+
+        if bootstrap {
+            self.load_current();
+            // From now on, progressive updates should anchor on what the
+            // user is actually seeing — not on the long-gone empty state.
+            self.scan_anchor = self.image_list.as_ref()
+                .and_then(|l| l.current())
+                .map(Path::to_path_buf);
+        } else if !anchor_found && is_final && anchor.is_some() {
+            // The displayed file was deleted on disk. `replace_entries`
+            // has already moved the cursor to the successor (or last
+            // entry); load whatever it now points at.
+            if let Some(a) = anchor.as_deref() {
+                if let Some(c) = self.prefetch.as_mut() {
+                    c.invalidate(a);
+                    c.bump_generation();
+                }
+            }
+            if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
+            self.load_current();
+        }
+
+        self.update_index_display();
+        if is_final {
+            self.trigger_prefetch();
+        }
+    }
+
+    /// Reset all displayed state when the active directory contains no
+    /// supported images (either at startup or after every file was removed).
+    fn clear_display_for_empty(&mut self) {
+        self.image_list = None;
+        self.image_info = None;
+        self.current_filename.clear();
+        self.current_index.clear();
+        self.status = AppStatus::EmptyFolder;
+        if let Some(r) = self.renderer.as_mut() { r.clear_image(); }
+        if let Some(w) = &self.window {
+            w.set_title(APP_NAME);
+            w.request_redraw();
+        }
+    }
+
     /// Load a new image (and its directory) at runtime — used by macOS Apple
     /// Events when Finder asks us to open a file after the window is up.
     #[cfg(target_os = "macos")]
@@ -1348,37 +1420,11 @@ impl ApplicationHandler<AppEvent> for App {
                 if is_final {
                     self.scan_rx = None;
                     self.scanning = false;
-                    self.scan_anchor = None;
                 }
 
                 if let Some(result) = latest {
                     match result {
-                        Ok(entries) => {
-                            if entries.is_empty() && is_final {
-                                if self.image_list.is_none() {
-                                    log::warn!("no supported images found");
-                                    self.status = AppStatus::EmptyFolder;
-                                    if let Some(w) = &self.window { w.request_redraw(); }
-                                }
-                            } else if !entries.is_empty() {
-                                log::debug!("scan update: {} images{}", entries.len(),
-                                    if is_final { " (final)" } else { "" });
-                                let anchor = self.scan_anchor.as_deref();
-                                if let Some(list) = self.image_list.as_mut() {
-                                    list.replace_entries(entries, anchor);
-                                } else {
-                                    let list = ImageList::from_single(entries[0].clone());
-                                    self.image_list = Some(list);
-                                    self.image_list.as_mut().unwrap()
-                                        .replace_entries(entries, anchor);
-                                    self.load_current();
-                                }
-                                self.update_index_display();
-                                if is_final {
-                                    self.trigger_prefetch();
-                                }
-                            }
-                        }
+                        Ok(entries) => self.apply_scan_update(entries, is_final),
                         Err(e) => {
                             log::error!("directory scan failed: {e}");
                             if self.image_list.is_none() {
@@ -1390,6 +1436,10 @@ impl ApplicationHandler<AppEvent> for App {
                 } else if is_final {
                     // No new data but scan finished — refresh index to drop the `…`
                     self.update_index_display();
+                }
+
+                if is_final {
+                    self.scan_anchor = None;
                 }
             }
 
