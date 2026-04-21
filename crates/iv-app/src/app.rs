@@ -1326,11 +1326,9 @@ impl ApplicationHandler<AppEvent> for App {
                         self.show_info = !self.show_info;
                         if let Some(w) = &self.window { w.request_redraw(); }
                     }
-                    "d" | "D" => {
-                        if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) {
-                            self.pending_delete = true;
-                            if let Some(w) = &self.window { w.request_redraw(); }
-                        }
+                    "d" | "D" if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) => {
+                        self.pending_delete = true;
+                        if let Some(w) = &self.window { w.request_redraw(); }
                     }
                     "h" | "H" => {
                         self.show_help = true;
@@ -1369,14 +1367,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             // macOS trackpad pinch-to-zoom
-            WindowEvent::PinchGesture { delta, .. } => {
-                if delta != 0.0 {
-                    let factor = (1.0 + delta) as f32;
-                    if let Some(r) = self.renderer.as_mut() {
-                        r.viewport.set_zoom(r.viewport.zoom() * factor);
-                    }
-                    if let Some(w) = &self.window { w.request_redraw(); }
+            WindowEvent::PinchGesture { delta, .. } if delta != 0.0 => {
+                let factor = (1.0 + delta) as f32;
+                if let Some(r) = self.renderer.as_mut() {
+                    r.viewport.set_zoom(r.viewport.zoom() * factor);
                 }
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
 
             // ── Mouse drag-to-pan ────────────────────────────────────────────

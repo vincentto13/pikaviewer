@@ -286,8 +286,7 @@ fn worker_loop(
         let t0 = std::time::Instant::now();
 
         let file_size = std::fs::metadata(&req.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+            .map_or(0, |m| m.len());
 
         let data = match std::fs::read(&req.path) {
             Ok(d) => d,
