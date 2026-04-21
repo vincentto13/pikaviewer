@@ -13,6 +13,7 @@ A cross-platform image viewer built in Rust. Target platforms: **Linux** (built 
 | UI overlay | `egui 0.29` + `egui-wgpu 0.29` + `egui-winit 0.29` | Filename/mode overlays, settings window |
 | Image decoding | `image 0.25` | JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, QOI |
 | HEIC/AVIF | `libheif-rs 1` (optional) | HEIC, HEIF, AVIF via system libheif |
+| RAW | `rsraw 0.1` (optional) | NEF, CR2/CR3, ARW, RAF, ORF, RW2, PEF, DNG via vendored LibRaw |
 | EXIF | `kamadak-exif 0.5` | Orientation auto-rotation, camera/lens/exposure metadata |
 | Config | `serde` + `toml` + `dirs` | TOML settings at OS-appropriate config path |
 | App entry | `clap 4` | CLI arg parsing |
@@ -25,6 +26,7 @@ crates/
   iv-core/          # FormatPlugin trait, PluginRegistry, ImageList, premultiplied alpha — zero UI deps
   iv-formats/       # image-rs plugin (wraps the `image` crate)
   iv-format-heic/   # libheif plugin — NOT a workspace member (only compiled with --features iv-app/heic)
+  iv-format-raw/    # LibRaw plugin — NOT a workspace member (only compiled with --features iv-app/raw)
   iv-renderer/      # wgpu renderer, Viewport (zoom/pan), display modes, WGSL shader, egui-wgpu
   iv-app/           # main binary: winit event loop, App struct, egui overlays, prefetch cache, settings
 ```
@@ -130,7 +132,7 @@ docker --context default cp iv-extract:/usr/local/bin/pikaviewer target/release/
 docker --context default rm iv-extract
 ```
 
-The Dockerfile builds with `--features iv-app/heic` (HEIC enabled in Docker builds).
+The Dockerfile builds with `--features iv-app/heic,iv-app/raw` (HEIC + RAW enabled in Docker builds).
 
 ### Running
 
@@ -205,6 +207,37 @@ returns an error message telling the user to rebuild with `--features iv-app/hei
 
 Pre-built packages (Docker, macOS DMG) enable the feature by default.
 
+## RAW support
+
+`iv-format-raw` is an **optional crate** that wraps `rsraw` (MIT wrapper) over LibRaw
+(LGPL-2.1/CDDL-1.0). LibRaw C++ sources are **vendored inside `rsraw-sys`** and compiled by
+`cc` at build time, so there is no system `libraw` to install — only a C++ toolchain and
+libclang (for `bindgen`). It is intentionally **not** a workspace member so that the default
+`cargo build` stays pure-MIT. The feature flag in `iv-app/Cargo.toml`:
+
+```toml
+[features]
+raw = ["dep:iv-format-raw", "iv-format-raw/rsraw"]
+```
+
+The crate has a stub fallback: when compiled without the `rsraw` sub-feature, `decode()`
+returns an error message telling the user to rebuild with `--features iv-app/raw`.
+
+Supported formats: NEF/NRW (Nikon), CR2/CR3/CRW (Canon), ARW/SR2/SRF (Sony), RAF (Fuji),
+ORF (Olympus), RW2 (Panasonic), PEF (Pentax), DNG (Adobe), plus generic `.raw`.
+
+Implementation notes:
+- `user_flip = 0` is set on the LibRaw params struct before `process()` so LibRaw does not
+  auto-rotate. The existing EXIF pipeline in `prefetch.rs` reads orientation and the renderer
+  applies rotation — keeping this uniform across all formats avoids double-rotation.
+- `set_use_camera_wb(true)` is enabled so colors match the camera's in-body rendering.
+- Output is 8-bit RGB from `process::<BIT_DEPTH_8>()`, expanded to RGBA8 with `has_alpha: false`.
+- First-time build of the `raw` feature compiles ~50 C++ files and adds a few MB to the binary.
+  Subsequent builds are cached. RAW decode itself takes ~1-2s per 24MP file; the existing
+  prefetch + parallel workers absorb the latency during navigation.
+
+Pre-built packages (Docker, macOS DMG) enable the feature by default.
+
 ## Repository
 
 GitHub: `github.com:vincentto13/pikaviewer.git`
@@ -235,6 +268,7 @@ GitLab: `ssh://git@gitlab.astrolabius.xyz:2424/vinci/pikaviewer/pikaviewer.git`
 - [x] Config file — TOML at `~/.config/pikaviewer/config.toml`
 - [x] Settings window — separate winit window, shared GPU context, checkbox UI
 - [x] HEIC/AVIF — `iv-format-heic` crate using libheif (optional feature, stub fallback)
+- [x] RAW — `iv-format-raw` crate using vendored LibRaw via `rsraw` (optional feature, stub fallback)
 - [x] File associations — `.desktop` + `xdg-mime` (Linux); macOS done via `Info.plist`
 - [x] Linux packaging — `.deb` + `.AppImage` via Docker
 - [x] macOS packaging — `.app` bundle + `.dmg` with icon generation, dylib bundling
@@ -244,10 +278,6 @@ GitLab: `ssh://git@gitlab.astrolabius.xyz:2424/vinci/pikaviewer/pikaviewer.git`
 - [x] EventLoopProxy wakeup — worker threads wake main loop directly (no polling)
 - [x] File deletion — `D` key with confirmation dialog, moves to trash on supported platforms
 - [x] Pedantic clippy — `#[must_use]`, safe `From` upcasts, doc backtick fixes
-
-## Planned next phases
-
-1. **RAW formats** — `iv-format-raw` crate using LibRaw (LGPL, optional feature)
 
 ## macOS file-open mechanism (`macos_events.rs`)
 

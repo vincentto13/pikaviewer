@@ -38,6 +38,8 @@ fn build_registry() -> PluginRegistry {
     let mut r = default_registry();
     #[cfg(feature = "heic")]
     r.register(iv_format_heic::HeicPlugin);
+    #[cfg(feature = "raw")]
+    r.register(iv_format_raw::RawPlugin);
     r
 }
 

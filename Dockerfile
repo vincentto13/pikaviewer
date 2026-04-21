@@ -16,11 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon-x11-dev \
     libudev-dev \
     libheif-dev \
+    clang \
+    libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --features iv-app/heic
+RUN cargo build --release --features iv-app/heic,iv-app/raw
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
