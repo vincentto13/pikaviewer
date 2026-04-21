@@ -344,12 +344,24 @@ impl App {
         } else if !anchor_found && is_final && anchor.is_some() {
             // The displayed file was deleted on disk. `replace_entries`
             // has already moved the cursor to the successor (or last
-            // entry); load whatever it now points at.
+            // entry); drop all state tied to the deleted file and let
+            // `load_current` bring in the successor — via a cache hit
+            // if it was already prefetched, or via a pending decode
+            // (whose DecodeReady will call apply_cache_entry) otherwise.
             if let Some(a) = anchor.as_deref() {
                 if let Some(c) = self.prefetch.as_mut() {
                     c.invalidate(a);
                     c.bump_generation();
                 }
+            }
+            // Clear stale overlays up front so a cache-miss Loading
+            // state doesn't keep showing the deleted file's name or
+            // EXIF panel until the decode finishes.
+            self.image_info = None;
+            if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
+                let filename = path.file_name()
+                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                self.current_filename.clone_from(&filename);
             }
             if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
             self.load_current();
