@@ -10,6 +10,7 @@ use app::AppEvent;
 mod app;
 mod config;
 mod desktop_integration;
+mod dir_watcher;
 mod prefetch;
 mod settings_window;
 use app::App;

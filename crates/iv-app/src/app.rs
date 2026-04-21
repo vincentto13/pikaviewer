@@ -14,6 +14,7 @@ use iv_core::{format::PluginRegistry, image_list::ImageList};
 use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
+use crate::dir_watcher::DirWatcher;
 use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
@@ -28,6 +29,8 @@ pub enum AppEvent {
     ScanProgress,
     /// Full directory scan finished — final sorted list available on `scan_rx`.
     ScanComplete,
+    /// A watched directory changed on disk — debounced by `DirWatcher`.
+    DirChanged,
 }
 
 /// How often (in number of new images found) to send a `ScanProgress` update.
@@ -96,6 +99,11 @@ pub struct App {
     prefetch:   Option<PrefetchCache>,
     scan_rx:    Option<mpsc::Receiver<ScanResult>>,
     scanning:   bool,
+    /// Stable path captured at scan start so progressive `replace_entries`
+    /// calls can always relocate the displayed image, even when a partial
+    /// snapshot doesn't contain it yet.
+    scan_anchor: Option<PathBuf>,
+    dir_watcher: Option<DirWatcher>,
     proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
 
@@ -164,6 +172,8 @@ impl App {
             prefetch:   None,
             scan_rx:    None,
             scanning:   false,
+            scan_anchor: None,
+            dir_watcher: None,
             proxy,
             status:     AppStatus::Ready,
             egui_ctx,
@@ -227,8 +237,7 @@ impl App {
             self.status = AppStatus::Loading;
 
             // Update overlay immediately so filename/index reflect the target
-            let filename = path.file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let filename = display_filename(&path);
             let index = Self::format_index(list, self.scanning);
             self.current_filename.clone_from(&filename);
             self.current_index.clone_from(&index);
@@ -247,9 +256,7 @@ impl App {
 
         renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
 
-        let filename = path
-            .file_name()
-            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let filename = display_filename(&path);
 
         self.image_info = Some(ImageInfo {
             width:     entry.image.width,
@@ -294,6 +301,94 @@ impl App {
         }
     }
 
+    /// React to a scan-thread snapshot. Preserves the displayed image when
+    /// `scan_anchor` is still present, reloads a neighbour when the anchor
+    /// has been deleted on disk, and clears the display when no supported
+    /// images remain.
+    fn apply_scan_update(&mut self, entries: Vec<PathBuf>, is_final: bool) {
+        if entries.is_empty() {
+            if is_final {
+                if self.image_list.is_some() {
+                    self.clear_display_for_empty();
+                } else {
+                    log::warn!("no supported images found");
+                    self.status = AppStatus::EmptyFolder;
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+            return;
+        }
+
+        log::debug!("scan update: {} images{}", entries.len(),
+            if is_final { " (final)" } else { "" });
+
+        let anchor = self.scan_anchor.clone();
+        let bootstrap = self.image_list.is_none();
+        if bootstrap {
+            self.image_list = Some(ImageList::from_single(entries[0].clone()));
+        }
+
+        // Anchor-deletion cleanup (displayed file missing from new list) is
+        // NOT done here: the final scan snapshot frequently piggybacks onto
+        // a `ScanProgress` event when the channel drain catches both at once,
+        // so `is_final` is unreliable at this point. The check runs once at
+        // `ScanComplete` via `finalize_anchor_check`.
+        self.image_list.as_mut().unwrap()
+            .replace_entries(entries, anchor.as_deref());
+
+        if bootstrap {
+            self.load_current();
+            // From now on, progressive updates should anchor on what the
+            // user is actually seeing — not on the long-gone empty state.
+            self.scan_anchor = self.image_list.as_ref()
+                .and_then(|l| l.current())
+                .map(Path::to_path_buf);
+        }
+
+        self.update_index_display();
+        if is_final {
+            self.trigger_prefetch();
+        }
+    }
+
+    /// Run at the end of a scan (on `ScanComplete`) to detect when the
+    /// displayed file was removed on disk. If so, drop all state tied to
+    /// it and load whatever the cursor now points at — the successor that
+    /// `replace_entries` picked during the final snapshot.
+    fn finalize_anchor_check(&mut self) {
+        let Some(anchor) = self.scan_anchor.clone() else { return };
+        let anchor_still_present = self.image_list.as_ref()
+            .is_some_and(|l| l.contains(&anchor));
+        if anchor_still_present { return; }
+
+        log::debug!("anchor {} missing after scan — reloading", anchor.display());
+        if let Some(c) = self.prefetch.as_mut() {
+            c.invalidate(&anchor);
+            c.bump_generation();
+        }
+        self.image_info = None;
+        if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
+            self.current_filename = display_filename(path);
+        }
+        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
+        self.load_current();
+    }
+
+    /// Reset all displayed state when the active directory contains no
+    /// supported images (either at startup or after every file was removed).
+    fn clear_display_for_empty(&mut self) {
+        self.image_list = None;
+        self.image_info = None;
+        self.current_filename.clear();
+        self.current_index.clear();
+        self.status = AppStatus::EmptyFolder;
+        if let Some(r) = self.renderer.as_mut() { r.clear_image(); }
+        if let Some(w) = &self.window {
+            w.set_title(APP_NAME);
+            w.request_redraw();
+        }
+    }
+
     /// Load a new image (and its directory) at runtime — used by macOS Apple
     /// Events when Finder asks us to open a file after the window is up.
     #[cfg(target_os = "macos")]
@@ -306,9 +401,70 @@ impl App {
     /// Start a two-phase progressive scan: show the first image immediately,
     /// then scan the full directory in the background.
     fn start_progressive_scan(&mut self, path: PathBuf) {
+        // For file opens, show the image immediately on the main thread —
+        // no event round-trip, so no race with the scan thread.
+        let canonical = path.canonicalize().unwrap_or(path);
+        let is_file = canonical.is_file();
+        let dir = if is_file {
+            canonical.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            canonical.clone()
+        };
+
+        if is_file {
+            self.image_list = Some(ImageList::from_single(canonical));
+            self.load_current();
+        } else {
+            self.status = AppStatus::Loading;
+        }
+
+        self.install_dir_watcher(&dir);
+        self.spawn_scan_thread(dir);
+    }
+
+    /// Re-scan the directory of the currently displayed image without touching
+    /// the existing image list or status — used when `DirWatcher` reports a
+    /// change. The existing `replace_entries` code path then reconciles.
+    fn rescan_current_dir(&mut self) {
+        let Some(dir) = self.current_dir() else { return };
+        log::debug!("rescanning {} after dir change", dir.display());
+        self.spawn_scan_thread(dir);
+    }
+
+    /// Directory of the currently displayed image (or the scanned directory
+    /// if no image is loaded yet).
+    fn current_dir(&self) -> Option<PathBuf> {
+        if let Some(w) = self.dir_watcher.as_ref() {
+            return Some(w.dir().to_path_buf());
+        }
+        self.image_list.as_ref()
+            .and_then(|l| l.current())
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    fn install_dir_watcher(&mut self, dir: &Path) {
+        // Drop the old watcher first so its debounce thread stops before we
+        // start a new one — prevents stray events from a previous directory.
+        self.dir_watcher = None;
+        match DirWatcher::new(dir, &self.registry, self.proxy.clone()) {
+            Ok(w)  => self.dir_watcher = Some(w),
+            Err(e) => log::warn!("dir watcher failed for {}: {e}", dir.display()),
+        }
+    }
+
+    fn spawn_scan_thread(&mut self, dir: PathBuf) {
         // Drop any previous scan's receiver so stale messages are discarded.
         // The old thread's send() will fail silently (we ignore send errors).
         self.scan_rx = None;
+
+        // Snapshot the currently displayed image path (falling back to the
+        // list cursor for the pre-decode bootstrap case) so every partial
+        // replace_entries call during this scan anchors on the same file.
+        self.scan_anchor = self.image_info.as_ref()
+            .map(|i| i.file_path.clone())
+            .or_else(|| self.image_list.as_ref()
+                .and_then(|l| l.current())
+                .map(Path::to_path_buf));
 
         let registry = Arc::clone(&self.registry);
         let proxy = self.proxy.clone();
@@ -316,29 +472,9 @@ impl App {
         self.scan_rx = Some(scan_rx);
         self.scanning = true;
 
-        // For file opens, show the image immediately on the main thread —
-        // no event round-trip, so no race with the scan thread.
-        let canonical = path.canonicalize().unwrap_or(path);
-        let is_file = canonical.is_file();
-        if is_file {
-            self.image_list = Some(ImageList::from_single(canonical.clone()));
-            self.load_current();
-        } else {
-            self.status = AppStatus::Loading;
-        }
-
-        let path = canonical;
         std::thread::Builder::new()
-            .name("startup-scan".into())
+            .name("dir-scan".into())
             .spawn(move || {
-                let dir = if is_file {
-                    path.parent().unwrap_or(Path::new(".")).to_path_buf()
-                } else {
-                    path
-                };
-
-                // Scan directory
-                let supported = registry.supported_extensions();
                 let read_dir = match std::fs::read_dir(&dir) {
                     Ok(rd) => rd,
                     Err(e) => {
@@ -354,15 +490,9 @@ impl App {
                 for entry in read_dir.filter_map(Result::ok) {
                     // Use file_type() from DirEntry (cached from readdir, no
                     // extra stat syscall) — critical on slow network drives.
-                    let is_file = entry.file_type().is_ok_and(|ft| ft.is_file());
-                    if !is_file { continue; }
+                    if !entry.file_type().is_ok_and(|ft| ft.is_file()) { continue; }
                     let p = entry.path();
-                    let is_image = p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| {
-                            supported.iter().any(|s| s.eq_ignore_ascii_case(ext))
-                        });
-                    if !is_image { continue; }
+                    if !registry.supports_path(&p) { continue; }
 
                     entries.push(p);
                     since_last_progress += 1;
@@ -370,27 +500,17 @@ impl App {
                     if since_last_progress >= SCAN_PROGRESS_INTERVAL {
                         since_last_progress = 0;
                         let mut snapshot = entries.clone();
-                        snapshot.sort_by(|a, b| {
-                            let an = a.file_name().unwrap_or_default();
-                            let bn = b.file_name().unwrap_or_default();
-                            an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                        });
+                        sort_by_filename(&mut snapshot);
                         let _ = scan_tx.send(Ok(snapshot));
                         let _ = proxy.send_event(AppEvent::ScanProgress);
                     }
                 }
 
-                // Final sorted list
-                entries.sort_by(|a, b| {
-                    let an = a.file_name().unwrap_or_default();
-                    let bn = b.file_name().unwrap_or_default();
-                    an.to_ascii_lowercase().cmp(&bn.to_ascii_lowercase())
-                });
-
+                sort_by_filename(&mut entries);
                 let _ = scan_tx.send(Ok(entries));
                 let _ = proxy.send_event(AppEvent::ScanComplete);
             })
-            .expect("failed to spawn startup thread");
+            .expect("failed to spawn scan thread");
     }
 
     fn navigate(&mut self, delta: i64) {
@@ -486,17 +606,7 @@ impl App {
         if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
 
         if list.is_empty() {
-            // No images left — clear the display
-            if let Some(r) = self.renderer.as_mut() {
-                r.clear_image();
-            }
-            self.current_filename.clear();
-            self.current_index.clear();
-            self.image_info = None;
-            if let Some(w) = &self.window {
-                w.set_title(APP_NAME);
-                w.request_redraw();
-            }
+            self.clear_display_for_empty();
         } else {
             self.load_current();
         }
@@ -546,6 +656,26 @@ impl App {
 
         renderer.render(&paint_jobs, &full_output.textures_delta, &screen_desc)
     }
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+/// Short label for `path` suitable for overlays and titles: the bare filename,
+/// falling back to the full display string for paths with no terminal name
+/// component (e.g. `/`).
+fn display_filename(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Sort `entries` by filename, case-insensitive. Uses `sort_by_cached_key`
+/// so each filename is lowercased once (O(n)) rather than once per
+/// comparison (O(n log n) allocations) — matters for large directories
+/// during progressive scans, which re-sort on every partial snapshot.
+fn sort_by_filename(entries: &mut [PathBuf]) {
+    entries.sort_by_cached_key(|p| {
+        p.file_name().unwrap_or_default().to_ascii_lowercase()
+    });
 }
 
 // ── Window helpers ────────────────────────────────────────────────────────────
@@ -1196,11 +1326,9 @@ impl ApplicationHandler<AppEvent> for App {
                         self.show_info = !self.show_info;
                         if let Some(w) = &self.window { w.request_redraw(); }
                     }
-                    "d" | "D" => {
-                        if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) {
-                            self.pending_delete = true;
-                            if let Some(w) = &self.window { w.request_redraw(); }
-                        }
+                    "d" | "D" if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) => {
+                        self.pending_delete = true;
+                        if let Some(w) = &self.window { w.request_redraw(); }
                     }
                     "h" | "H" => {
                         self.show_help = true;
@@ -1239,14 +1367,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             // macOS trackpad pinch-to-zoom
-            WindowEvent::PinchGesture { delta, .. } => {
-                if delta != 0.0 {
-                    let factor = (1.0 + delta) as f32;
-                    if let Some(r) = self.renderer.as_mut() {
-                        r.viewport.set_zoom(r.viewport.zoom() * factor);
-                    }
-                    if let Some(w) = &self.window { w.request_redraw(); }
+            WindowEvent::PinchGesture { delta, .. } if delta != 0.0 => {
+                let factor = (1.0 + delta) as f32;
+                if let Some(r) = self.renderer.as_mut() {
+                    r.viewport.set_zoom(r.viewport.zoom() * factor);
                 }
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
 
             // ── Mouse drag-to-pan ────────────────────────────────────────────
@@ -1299,31 +1425,7 @@ impl ApplicationHandler<AppEvent> for App {
 
                 if let Some(result) = latest {
                     match result {
-                        Ok(entries) => {
-                            if entries.is_empty() && is_final {
-                                if self.image_list.is_none() {
-                                    log::warn!("no supported images found");
-                                    self.status = AppStatus::EmptyFolder;
-                                    if let Some(w) = &self.window { w.request_redraw(); }
-                                }
-                            } else if !entries.is_empty() {
-                                log::debug!("scan update: {} images{}", entries.len(),
-                                    if is_final { " (final)" } else { "" });
-                                if let Some(list) = self.image_list.as_mut() {
-                                    list.replace_entries(entries);
-                                } else {
-                                    self.image_list = Some(ImageList::from_single(
-                                        entries[0].clone(),
-                                    ));
-                                    self.image_list.as_mut().unwrap().replace_entries(entries);
-                                    self.load_current();
-                                }
-                                self.update_index_display();
-                                if is_final {
-                                    self.trigger_prefetch();
-                                }
-                            }
-                        }
+                        Ok(entries) => self.apply_scan_update(entries, is_final),
                         Err(e) => {
                             log::error!("directory scan failed: {e}");
                             if self.image_list.is_none() {
@@ -1336,6 +1438,15 @@ impl ApplicationHandler<AppEvent> for App {
                     // No new data but scan finished — refresh index to drop the `…`
                     self.update_index_display();
                 }
+
+                if is_final {
+                    self.finalize_anchor_check();
+                    self.scan_anchor = None;
+                }
+            }
+
+            AppEvent::DirChanged => {
+                self.rescan_current_dir();
             }
 
             AppEvent::DecodeReady => {

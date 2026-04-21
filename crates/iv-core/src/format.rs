@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::Path;
 use std::sync::LazyLock;
 
 // ── Error ────────────────────────────────────────────────────────────────────
@@ -127,5 +128,15 @@ impl PluginRegistry {
             .iter()
             .flat_map(|p| p.descriptor().extensions.iter().copied())
             .collect()
+    }
+
+    /// Whether any registered plugin can decode a file at `path`, based on
+    /// its extension. Case-insensitive; returns `false` for paths with no
+    /// extension or with non-UTF-8 extensions.
+    #[must_use]
+    pub fn supports_path(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| self.plugins.iter().any(|p| p.supports_extension(ext)))
     }
 }
