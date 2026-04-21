@@ -99,6 +99,10 @@ pub struct App {
     prefetch:   Option<PrefetchCache>,
     scan_rx:    Option<mpsc::Receiver<ScanResult>>,
     scanning:   bool,
+    /// Stable path captured at scan start so progressive `replace_entries`
+    /// calls can always relocate the displayed image, even when a partial
+    /// snapshot doesn't contain it yet.
+    scan_anchor: Option<PathBuf>,
     dir_watcher: Option<DirWatcher>,
     proxy:      EventLoopProxy<AppEvent>,
     status:     AppStatus,
@@ -168,6 +172,7 @@ impl App {
             prefetch:   None,
             scan_rx:    None,
             scanning:   false,
+            scan_anchor: None,
             dir_watcher: None,
             proxy,
             status:     AppStatus::Ready,
@@ -366,6 +371,15 @@ impl App {
         // Drop any previous scan's receiver so stale messages are discarded.
         // The old thread's send() will fail silently (we ignore send errors).
         self.scan_rx = None;
+
+        // Snapshot the currently displayed image path (falling back to the
+        // list cursor for the pre-decode bootstrap case) so every partial
+        // replace_entries call during this scan anchors on the same file.
+        self.scan_anchor = self.image_info.as_ref()
+            .map(|i| i.file_path.clone())
+            .or_else(|| self.image_list.as_ref()
+                .and_then(|l| l.current())
+                .map(Path::to_path_buf));
 
         let registry = Arc::clone(&self.registry);
         let proxy = self.proxy.clone();
@@ -1334,6 +1348,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if is_final {
                     self.scan_rx = None;
                     self.scanning = false;
+                    self.scan_anchor = None;
                 }
 
                 if let Some(result) = latest {
@@ -1348,13 +1363,14 @@ impl ApplicationHandler<AppEvent> for App {
                             } else if !entries.is_empty() {
                                 log::debug!("scan update: {} images{}", entries.len(),
                                     if is_final { " (final)" } else { "" });
+                                let anchor = self.scan_anchor.as_deref();
                                 if let Some(list) = self.image_list.as_mut() {
-                                    list.replace_entries(entries);
+                                    list.replace_entries(entries, anchor);
                                 } else {
-                                    self.image_list = Some(ImageList::from_single(
-                                        entries[0].clone(),
-                                    ));
-                                    self.image_list.as_mut().unwrap().replace_entries(entries);
+                                    let list = ImageList::from_single(entries[0].clone());
+                                    self.image_list = Some(list);
+                                    self.image_list.as_mut().unwrap()
+                                        .replace_entries(entries, anchor);
                                     self.load_current();
                                 }
                                 self.update_index_display();

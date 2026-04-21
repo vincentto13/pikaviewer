@@ -54,12 +54,16 @@ impl ImageList {
     }
 
     /// Replace the entry list with a fully scanned and sorted list,
-    /// repositioning the cursor at the same file if it exists in the new list.
-    pub fn replace_entries(&mut self, entries: Vec<PathBuf>) {
-        let current_path = self.current().map(Path::to_path_buf);
+    /// repositioning the cursor at `anchor` if it exists in the new list.
+    ///
+    /// The caller is responsible for supplying a stable anchor — using
+    /// `self.current()` here would be unsafe during progressive scans,
+    /// because if `anchor` is missing from a partial snapshot the cursor
+    /// resets to 0 and a subsequent call would anchor on the wrong file.
+    pub fn replace_entries(&mut self, entries: Vec<PathBuf>, anchor: Option<&Path>) {
         self.entries = entries;
-        self.current = current_path
-            .and_then(|p| self.entries.iter().position(|e| e == &p))
+        self.current = anchor
+            .and_then(|p| self.entries.iter().position(|e| e == p))
             .unwrap_or(0);
     }
 
