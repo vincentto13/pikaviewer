@@ -341,36 +341,43 @@ impl App {
             self.scan_anchor = self.image_list.as_ref()
                 .and_then(|l| l.current())
                 .map(Path::to_path_buf);
-        } else if !anchor_found && is_final && anchor.is_some() {
-            // The displayed file was deleted on disk. `replace_entries`
-            // has already moved the cursor to the successor (or last
-            // entry); drop all state tied to the deleted file and let
-            // `load_current` bring in the successor — via a cache hit
-            // if it was already prefetched, or via a pending decode
-            // (whose DecodeReady will call apply_cache_entry) otherwise.
-            if let Some(a) = anchor.as_deref() {
-                if let Some(c) = self.prefetch.as_mut() {
-                    c.invalidate(a);
-                    c.bump_generation();
-                }
-            }
-            // Clear stale overlays up front so a cache-miss Loading
-            // state doesn't keep showing the deleted file's name or
-            // EXIF panel until the decode finishes.
-            self.image_info = None;
-            if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
-                let filename = path.file_name()
-                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-                self.current_filename.clone_from(&filename);
-            }
-            if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
-            self.load_current();
         }
+        // Anchor-deletion cleanup (displayed file missing from new list) is
+        // NOT done here: the final scan snapshot frequently piggybacks onto
+        // a `ScanProgress` event when the channel drain catches both at once,
+        // so `is_final` is unreliable at this point. The check runs once at
+        // `ScanComplete` via `finalize_anchor_check`.
+        let _ = anchor_found;
 
         self.update_index_display();
         if is_final {
             self.trigger_prefetch();
         }
+    }
+
+    /// Run at the end of a scan (on `ScanComplete`) to detect when the
+    /// displayed file was removed on disk. If so, drop all state tied to
+    /// it and load whatever the cursor now points at — the successor that
+    /// `replace_entries` picked during the final snapshot.
+    fn finalize_anchor_check(&mut self) {
+        let Some(anchor) = self.scan_anchor.clone() else { return };
+        let anchor_still_present = self.image_list.as_ref()
+            .is_some_and(|l| l.contains(&anchor));
+        if anchor_still_present { return; }
+
+        log::debug!("anchor {} missing after scan — reloading", anchor.display());
+        if let Some(c) = self.prefetch.as_mut() {
+            c.invalidate(&anchor);
+            c.bump_generation();
+        }
+        self.image_info = None;
+        if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
+            let filename = path.file_name()
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.current_filename.clone_from(&filename);
+        }
+        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
+        self.load_current();
     }
 
     /// Reset all displayed state when the active directory contains no
@@ -1451,6 +1458,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 if is_final {
+                    self.finalize_anchor_check();
                     self.scan_anchor = None;
                 }
             }

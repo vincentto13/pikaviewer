@@ -96,6 +96,11 @@ impl ImageList {
     #[must_use]
     pub fn position(&self) -> usize { self.current + 1 }
 
+    #[must_use]
+    pub fn contains(&self, path: &Path) -> bool {
+        self.entries.iter().any(|e| e == path)
+    }
+
     pub fn current(&self) -> Option<&Path> {
         self.entries.get(self.current).map(PathBuf::as_path)
     }
