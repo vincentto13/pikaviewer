@@ -15,6 +15,7 @@ use iv_renderer::{DisplayMode, GpuContext, Renderer};
 
 use crate::config::Settings;
 use crate::dir_watcher::DirWatcher;
+use crate::input::{self, Action, Dir, InputContext};
 use crate::prefetch::{self, CacheEntry, ExifData, PrefetchCache};
 use crate::settings_window::SettingsWindow;
 
@@ -82,21 +83,33 @@ enum AppStatus {
 
 type ScanResult = Result<Vec<PathBuf>, String>;
 
+/// All session state that only exists after `resumed()` has run. Keeping these
+/// bundled means the rest of the code only checks one `Option` instead of five,
+/// and eliminates the "if-let-Some pair" noise that littered every handler.
+///
+/// Field declaration order is the drop order: prefetch first (joins worker
+/// threads before any wgpu resource is gone), then the settings window, then
+/// the renderer, egui state, gpu, and finally the window itself.
+struct RunningState {
+    prefetch:   PrefetchCache,
+    renderer:   Renderer,
+    egui_state: egui_winit::State,
+    gpu:        Arc<GpuContext>,
+    window:     Arc<Window>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub start_path: Option<PathBuf>,
 
-    // These are dropped explicitly in Drop impl to control ordering
-    // relative to winit's Wayland connection teardown.
+    // `running` holds window/renderer/gpu/egui_state/prefetch as one unit;
+    // None before `resumed()`, always Some after. Explicit drop order lives
+    // in the RunningState field declaration.
     settings_window: Option<SettingsWindow>,
-    renderer: Option<Renderer>,
-    gpu:      Option<Arc<GpuContext>>,
-    egui_state: Option<egui_winit::State>,
-    window:   Option<Arc<Window>>,
+    running: Option<RunningState>,
 
     registry:   Arc<PluginRegistry>,
     image_list: Option<ImageList>,
-    prefetch:   Option<PrefetchCache>,
     scan_rx:    Option<mpsc::Receiver<ScanResult>>,
     scanning:   bool,
     /// Stable path captured at scan start so progressive `replace_entries`
@@ -109,7 +122,7 @@ pub struct App {
 
     egui_ctx:   egui::Context,
 
-    settings:        Settings,
+    settings: Settings,
 
     // Overlay data
     current_filename: String,  // just the bare filename (no index)
@@ -134,17 +147,11 @@ impl Drop for App {
         // Persist window size on exit (not on every resize).
         self.settings.save();
 
-        // Drop prefetch first — dropping request_tx causes worker thread exit.
-        // Then wgpu resources in dependency order:
-        // 1. prefetch       (worker thread, no GPU deps)
-        // 2. settings window (Surface + egui renderer)
-        // 3. main renderer   (Surface + Pipeline + textures)
-        // 4. GPU context     (Device/Queue)
-        // 5. window + egui_state drop naturally after this
-        drop(self.prefetch.take());
+        // Settings window drops first — its Surface must go before the main
+        // renderer releases the shared GpuContext. Then the running bundle
+        // drops in field order: prefetch → renderer → egui_state → gpu → window.
         drop(self.settings_window.take());
-        drop(self.renderer.take());
-        drop(self.gpu.take());
+        drop(self.running.take());
     }
 }
 
@@ -164,12 +171,9 @@ impl App {
 
         Self {
             start_path,
-            window:   None,
-            renderer: None,
-            gpu:      None,
+            running: None,
             registry,
             image_list: None,
-            prefetch:   None,
             scan_rx:    None,
             scanning:   false,
             scan_anchor: None,
@@ -177,7 +181,6 @@ impl App {
             proxy,
             status:     AppStatus::Ready,
             egui_ctx,
-            egui_state: None,
             settings,
             settings_window: None,
             current_filename: String::new(),
@@ -195,6 +198,9 @@ impl App {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    fn running(&self) -> Option<&RunningState> { self.running.as_ref() }
+    fn running_mut(&mut self) -> Option<&mut RunningState> { self.running.as_mut() }
+
     /// Format the position index string, appending `…` while scan is in progress.
     fn format_index(list: &ImageList, scanning: bool) -> String {
         if scanning {
@@ -210,53 +216,70 @@ impl App {
         let Some(list) = self.image_list.as_ref() else { return };
         let index = Self::format_index(list, self.scanning);
         self.current_index.clone_from(&index);
-        if let Some(w) = &self.window {
-            w.set_title(&format!("{APP_NAME} - {} {index}", self.current_filename));
-            w.request_redraw();
+        if let Some(s) = self.running() {
+            s.window.set_title(&format!("{APP_NAME} - {} {index}", self.current_filename));
+            s.window.request_redraw();
         }
     }
 
     fn load_current(&mut self) {
-        let Some(list) = self.image_list.as_ref() else { return };
-        let Some(path) = list.current() else { return };
-        let path = path.to_path_buf();
+        // Resolve target path + display labels up front so the borrow of
+        // `self.image_list` ends before we reach for `self.running`.
+        let (path, filename, index) = {
+            let Some(list) = self.image_list.as_ref() else { return };
+            let Some(current) = list.current() else { return };
+            let p = current.to_path_buf();
+            let f = display_filename(&p);
+            let i = Self::format_index(list, self.scanning);
+            (p, f, i)
+        };
 
-        // Try the prefetch cache first
-        if let Some(ref mut cache) = self.prefetch {
-            if let Some(entry) = cache.get(&path) {
-                log::debug!("cache hit: {}", path.display());
-                self.status = AppStatus::Ready;
-                self.apply_cache_entry(path, entry);
-                self.trigger_prefetch();
-                return;
-            }
-            // Cache miss — request background decode
-            log::debug!("cache miss: {}", path.display());
-            cache.request(path.clone());
-            cache.waiting_for_current = true;
-            self.status = AppStatus::Loading;
-
-            // Update overlay immediately so filename/index reflect the target
-            let filename = display_filename(&path);
-            let index = Self::format_index(list, self.scanning);
-            self.current_filename.clone_from(&filename);
-            self.current_index.clone_from(&index);
-            if let Some(w) = &self.window {
-                w.set_title(&format!("{APP_NAME} - {filename} {index}"));
-                w.request_redraw();
-            }
+        // Probe the cache through `running` without retaining the borrow —
+        // `apply_cache_entry` below needs `&mut self`.
+        let cached = self.running_mut().and_then(|s| s.prefetch.get(&path));
+        if let Some(entry) = cached {
+            log::debug!("cache hit: {}", path.display());
+            self.status = AppStatus::Ready;
+            self.apply_cache_entry(path, entry);
+            self.trigger_prefetch();
+            return;
         }
 
+        // Cache miss — kick off a background decode and update the overlay
+        // to reflect the target filename immediately.
+        let Some(s) = self.running.as_mut() else { return };
+        log::debug!("cache miss: {}", path.display());
+        s.prefetch.request(path.clone());
+        s.prefetch.waiting_for_current = true;
+        s.window.set_title(&format!("{APP_NAME} - {filename} {index}"));
+        s.window.request_redraw();
+
+        self.status = AppStatus::Loading;
+        self.current_filename = filename;
+        self.current_index = index;
     }
 
     /// Apply a cache entry: set texture, EXIF rotation, update overlays.
     fn apply_cache_entry(&mut self, path: PathBuf, entry: CacheEntry) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let list = self.image_list.as_ref();
-
-        renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
-
         let filename = display_filename(&path);
+        let scanning = self.scanning;
+        let index = self.image_list.as_ref()
+            .map(|l| Self::format_index(l, scanning))
+            .unwrap_or_default();
+
+        let Some(s) = self.running.as_mut() else { return };
+
+        s.renderer.rotation = prefetch::orientation_rotation(entry.exif.orientation);
+        s.renderer.set_image(&entry.image);
+        log::debug!("loaded {}×{} {}", entry.image.width, entry.image.height, filename);
+
+        s.window.set_title(&format!("{APP_NAME} - {filename} {index}"));
+        if let Some((new_w, new_h)) = s.renderer.compute_window_size() {
+            let clamped = clamped_size(&s.window, new_w, new_h);
+            let _ = s.window.request_inner_size(clamped);
+            clamp_to_screen(&s.window);
+        }
+        s.window.request_redraw();
 
         self.image_info = Some(ImageInfo {
             width:     entry.image.width,
@@ -265,40 +288,20 @@ impl App {
             file_path: path,
             exif:      entry.exif,
         });
-
-        renderer.set_image(&entry.image);
-        log::debug!("loaded {}×{} {}", entry.image.width, entry.image.height, filename);
-
-        let scanning = self.scanning;
-        let index = list.map(|l| Self::format_index(l, scanning))
-            .unwrap_or_default();
-        self.current_filename.clone_from(&filename);
-        self.current_index.clone_from(&index);
+        self.current_filename = filename;
+        self.current_index = index;
         self.status = AppStatus::Ready;
-
-        if let Some(w) = &self.window {
-            w.set_title(&format!("{APP_NAME} - {filename} {index}"));
-
-            if let Some((new_w, new_h)) = renderer.compute_window_size() {
-                let _ = w.request_inner_size(clamped_size(w, new_w, new_h));
-                clamp_to_screen(w);
-            }
-            w.request_redraw();
-        }
     }
 
     /// Request prefetch of adjacent images (N+1, N-1).
     fn trigger_prefetch(&mut self) {
-        let (Some(list), Some(cache)) =
-            (self.image_list.as_ref(), self.prefetch.as_mut())
-        else { return };
-
-        if let Some(next) = list.peek_offset(1) {
-            cache.request(next.to_path_buf());
-        }
-        if let Some(prev) = list.peek_offset(-1) {
-            cache.request(prev.to_path_buf());
-        }
+        let next = self.image_list.as_ref().and_then(|l| l.peek_offset(1))
+            .map(Path::to_path_buf);
+        let prev = self.image_list.as_ref().and_then(|l| l.peek_offset(-1))
+            .map(Path::to_path_buf);
+        let Some(s) = self.running.as_mut() else { return };
+        if let Some(p) = next { s.prefetch.request(p); }
+        if let Some(p) = prev { s.prefetch.request(p); }
     }
 
     /// React to a scan-thread snapshot. Preserves the displayed image when
@@ -313,7 +316,7 @@ impl App {
                 } else {
                     log::warn!("no supported images found");
                     self.status = AppStatus::EmptyFolder;
-                    if let Some(w) = &self.window { w.request_redraw(); }
+                    if let Some(s) = self.running() { s.window.request_redraw(); }
                 }
             }
             return;
@@ -362,15 +365,17 @@ impl App {
         if anchor_still_present { return; }
 
         log::debug!("anchor {} missing after scan — reloading", anchor.display());
-        if let Some(c) = self.prefetch.as_mut() {
-            c.invalidate(&anchor);
-            c.bump_generation();
+        let current_filename = self.image_list.as_ref()
+            .and_then(|l| l.current())
+            .map(display_filename);
+        if let Some(s) = self.running.as_mut() {
+            s.prefetch.invalidate(&anchor);
+            s.prefetch.bump_generation();
+            s.renderer.rotation = 0;
+            s.renderer.viewport.reset_zoom();
         }
         self.image_info = None;
-        if let Some(path) = self.image_list.as_ref().and_then(|l| l.current()) {
-            self.current_filename = display_filename(path);
-        }
-        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
+        if let Some(f) = current_filename { self.current_filename = f; }
         self.load_current();
     }
 
@@ -382,10 +387,10 @@ impl App {
         self.current_filename.clear();
         self.current_index.clear();
         self.status = AppStatus::EmptyFolder;
-        if let Some(r) = self.renderer.as_mut() { r.clear_image(); }
-        if let Some(w) = &self.window {
-            w.set_title(APP_NAME);
-            w.request_redraw();
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.clear_image();
+            s.window.set_title(APP_NAME);
+            s.window.request_redraw();
         }
     }
 
@@ -393,8 +398,10 @@ impl App {
     /// Events when Finder asks us to open a file after the window is up.
     #[cfg(target_os = "macos")]
     fn load_path(&mut self, path: PathBuf) {
-        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; }
-        if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.rotation = 0;
+            s.prefetch.bump_generation();
+        }
         self.start_progressive_scan(path);
     }
 
@@ -515,25 +522,26 @@ impl App {
 
     fn navigate(&mut self, delta: i64) {
         log::debug!("navigate delta={delta}");
-        if let Some(r) = self.renderer.as_mut() { r.rotation = 0; r.viewport.reset_zoom(); }
-        if let Some(c) = self.prefetch.as_mut() { c.bump_generation(); }
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.rotation = 0;
+            s.renderer.viewport.reset_zoom();
+            s.prefetch.bump_generation();
+        }
         if let Some(l) = self.image_list.as_mut() { l.advance(delta); }
         self.load_current();
     }
 
     fn toggle_mode(&mut self) {
         log::debug!("toggle display mode");
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.viewport.reset_zoom();
-            renderer.display_mode = renderer.display_mode.next();
-            if let Some(w) = &self.window {
-                match renderer.display_mode {
-                    DisplayMode::Fullscreen => {
-                        w.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                    }
-                    DisplayMode::Window => {
-                        w.set_fullscreen(None);
-                    }
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.viewport.reset_zoom();
+            s.renderer.display_mode = s.renderer.display_mode.next();
+            match s.renderer.display_mode {
+                DisplayMode::Fullscreen => {
+                    s.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                }
+                DisplayMode::Window => {
+                    s.window.set_fullscreen(None);
                 }
             }
         }
@@ -542,24 +550,72 @@ impl App {
     }
 
     fn zoom_in(&mut self) {
-        if let Some(r) = self.renderer.as_mut() {
-            r.viewport.zoom_in(ZOOM_STEP);
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.viewport.zoom_in(ZOOM_STEP);
+            s.window.request_redraw();
         }
-        if let Some(w) = &self.window { w.request_redraw(); }
     }
 
     fn zoom_out(&mut self) {
-        if let Some(r) = self.renderer.as_mut() {
-            r.viewport.zoom_out(ZOOM_STEP);
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.viewport.zoom_out(ZOOM_STEP);
+            s.window.request_redraw();
         }
-        if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    fn pan(&mut self, dir: Dir) {
+        let Some(s) = self.running.as_mut() else { return };
+        let step = PAN_STEP / s.renderer.viewport.zoom();
+        let (dx, dy) = match dir {
+            Dir::Left  => (-step, 0.0),
+            Dir::Right => ( step, 0.0),
+            Dir::Up    => (0.0, -step),
+            Dir::Down  => (0.0,  step),
+        };
+        s.renderer.viewport.adjust_pan(dx, dy);
+        s.window.request_redraw();
+    }
+
+    fn reset_zoom(&mut self) {
+        if let Some(s) = self.running.as_mut() {
+            s.renderer.viewport.reset_zoom();
+            s.window.request_redraw();
+        }
+    }
+
+    fn apply_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::NavigateNext  => self.navigate(1),
+            Action::NavigatePrev  => self.navigate(-1),
+            Action::Pan(d)        => self.pan(d),
+            Action::ResetZoom     => self.reset_zoom(),
+            Action::ZoomIn        => self.zoom_in(),
+            Action::ZoomOut       => self.zoom_out(),
+            Action::ToggleMode    => self.toggle_mode(),
+            Action::RotateCw      => self.rotate_image(true),
+            Action::RotateCcw     => self.rotate_image(false),
+            Action::ToggleInfo    => {
+                self.show_info = !self.show_info;
+                if let Some(s) = self.running() { s.window.request_redraw(); }
+            }
+            Action::RequestDelete => {
+                self.pending_delete = true;
+                if let Some(s) = self.running() { s.window.request_redraw(); }
+            }
+            Action::ShowHelp      => {
+                self.show_help = true;
+                if let Some(s) = self.running() { s.window.request_redraw(); }
+            }
+            Action::OpenSettings  => self.open_settings(event_loop),
+            Action::Quit          => event_loop.exit(),
+        }
     }
 
     fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
         if self.settings_window.is_some() {
             return; // already open
         }
-        let Some(gpu) = self.gpu.clone() else { return };
+        let Some(gpu) = self.running().map(|s| s.gpu.clone()) else { return };
         match SettingsWindow::open(event_loop, gpu) {
             Ok(sw) => { self.settings_window = Some(sw); }
             Err(e) => log::error!("open settings: {e}"),
@@ -569,8 +625,9 @@ impl App {
     fn close_settings(&mut self) {
         if let Some(sw) = self.settings_window.take() {
             if sw.dirty {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.fit_to_image = self.settings.window.fit_to_image;
+                let fit = self.settings.window.fit_to_image;
+                if let Some(s) = self.running.as_mut() {
+                    s.renderer.fit_to_image = fit;
                 }
                 self.settings.save();
                 self.load_current();
@@ -580,17 +637,15 @@ impl App {
 
     fn rotate_image(&mut self, clockwise: bool) {
         log::debug!("rotate {}", if clockwise { "CW" } else { "CCW" });
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.viewport.reset_zoom();
-            renderer.rotate(clockwise);
-            if let Some(w) = &self.window {
-                if let Some((nw, nh)) = renderer.compute_window_size() {
-                    let _ = w.request_inner_size(clamped_size(w, nw, nh));
-                    clamp_to_screen(w);
-                }
-                w.request_redraw();
-            }
+        let Some(s) = self.running.as_mut() else { return };
+        s.renderer.viewport.reset_zoom();
+        s.renderer.rotate(clockwise);
+        if let Some((nw, nh)) = s.renderer.compute_window_size() {
+            let clamped = clamped_size(&s.window, nw, nh);
+            let _ = s.window.request_inner_size(clamped);
+            clamp_to_screen(&s.window);
         }
+        s.window.request_redraw();
     }
 
     fn delete_current(&mut self) {
@@ -603,9 +658,12 @@ impl App {
         }
         log::info!("deleted: {}", removed.display());
 
-        if let Some(c) = self.prefetch.as_mut() { c.invalidate(&removed); }
+        let empty_now = self.image_list.as_ref().is_some_and(ImageList::is_empty);
+        if let Some(s) = self.running.as_mut() {
+            s.prefetch.invalidate(&removed);
+        }
 
-        if list.is_empty() {
+        if empty_now {
             self.clear_display_for_empty();
         } else {
             self.load_current();
@@ -613,18 +671,17 @@ impl App {
     }
 
     fn render_frame(&mut self) -> Result<()> {
-        let (Some(renderer), Some(egui_state), Some(window)) =
-            (self.renderer.as_mut(), self.egui_state.as_mut(), self.window.as_ref())
-        else { return Ok(()) };
+        let Some(s) = self.running.as_mut() else { return Ok(()) };
 
-        let pixels_per_point = window.scale_factor() as f32;
+        let pixels_per_point = s.window.scale_factor() as f32;
 
         let snap = FrameSnapshot {
             filename:       self.current_filename.clone(),
             index:          self.current_index.clone(),
-            scale_pct:      renderer.image_size.map(|_| (renderer.viewport.scale() * 100.0).round().max(1.0) as u32),
+            scale_pct:      s.renderer.image_size
+                .map(|_| (s.renderer.viewport.scale() * 100.0).round().max(1.0) as u32),
             mode_changed:   self.mode_changed_at,
-            mode_label:     renderer.display_mode.label(),
+            mode_label:     s.renderer.display_mode.label(),
             show_info:      self.show_info,
             pending_delete: self.pending_delete,
             show_help:      self.show_help,
@@ -632,12 +689,12 @@ impl App {
         };
         let image_info = self.image_info.as_ref();
 
-        let raw_input   = egui_state.take_egui_input(window);
+        let raw_input   = s.egui_state.take_egui_input(&s.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_ui(ctx, &snap, image_info);
         });
 
-        egui_state.handle_platform_output(window, full_output.platform_output);
+        s.egui_state.handle_platform_output(&s.window, full_output.platform_output);
 
         // If egui itself wants another frame (e.g. to settle a freshly-shown
         // window's anchor position), schedule a winit redraw immediately.
@@ -645,16 +702,16 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|vo| vo.repaint_delay == std::time::Duration::ZERO);
         if wants_repaint {
-            window.request_redraw();
+            s.window.request_redraw();
         }
 
         let paint_jobs  = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
         let screen_desc = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [window.inner_size().width, window.inner_size().height],
+            size_in_pixels: [s.window.inner_size().width, s.window.inner_size().height],
             pixels_per_point,
         };
 
-        renderer.render(&paint_jobs, &full_output.textures_delta, &screen_desc)
+        s.renderer.render(&paint_jobs, &full_output.textures_delta, &screen_desc)
     }
 }
 
@@ -852,37 +909,19 @@ fn draw_ui(ctx: &egui::Context, snap: &FrameSnapshot, image_info: Option<&ImageI
                 );
                 ui.add_space(10.0);
 
-                // (keys, separator, description)
-                // "/" = alternatives, "+" = combo
-                let shortcuts: &[(&[&str], &str, &str)] = &[
-                    (&["Right", "Down"],                "/", "Next image (pan right/down when zoomed)"),
-                    (&["Left", "Up"],                   "/", "Prev image (pan left/up when zoomed)"),
-                    (&["."],                            "/", "Next image"),
-                    (&[","],                            "/", "Previous image"),
-                    (&["Space"],                        "/", "Next image / reset zoom when zoomed"),
-                    (&["Shift+Space"],                  "/", "Prev image / reset zoom when zoomed"),
-                    (&["+", "="],                       "/", "Zoom in"),
-                    (&["-"],                            "/", "Zoom out / reset"),
-                    (&["M"],                            "/", "Cycle display mode"),
-                    (&["R", "]"],                       "/", "Rotate 90\u{00b0} clockwise"),
-                    (&["L", "["],                       "/", "Rotate 90\u{00b0} counter-clockwise"),
-                    (&["I"],                            "/", "Toggle image info panel"),
-                    (&["D"],                            "/", "Delete current image"),
-                    (&["H"],                            "/", "Show this help"),
-                    (&["Ctrl/\u{2318}", ","],           "+", "Open settings"),
-                    (&["Ctrl/\u{2318}", "W"],           "+", "Close window"),
-                    (&["Q", "Escape"],                  "/", "Quit"),
-                ];
-
                 egui::Grid::new("help_grid")
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
-                        for (keys, sep, desc) in shortcuts {
+                        for binding in input::BINDINGS {
+                            let sep = match binding.sep {
+                                input::KeySep::Or   => "/",
+                                input::KeySep::Plus => "+",
+                            };
                             ui.horizontal(|ui| {
-                                for (i, key) in keys.iter().enumerate() {
+                                for (i, key) in binding.keys.iter().enumerate() {
                                     if i > 0 {
                                         ui.label(
-                                            egui::RichText::new(*sep)
+                                            egui::RichText::new(sep)
                                                 .color(egui::Color32::from_gray(100))
                                                 .size(14.0),
                                         );
@@ -891,7 +930,7 @@ fn draw_ui(ctx: &egui::Context, snap: &FrameSnapshot, image_info: Option<&ImageI
                                 }
                             });
                             ui.label(
-                                egui::RichText::new(*desc)
+                                egui::RichText::new(binding.desc)
                                     .color(egui::Color32::from_gray(170))
                                     .size(15.0),
                             );
@@ -1169,11 +1208,14 @@ impl ApplicationHandler<AppEvent> for App {
             None,  // max_texture_side
         );
 
-        self.window     = Some(window);
-        self.renderer   = Some(renderer);
-        self.gpu        = Some(gpu);
-        self.egui_state = Some(egui_state);
-        self.prefetch   = Some(PrefetchCache::new(Arc::clone(&self.registry), self.proxy.clone()));
+        let prefetch = PrefetchCache::new(Arc::clone(&self.registry), self.proxy.clone());
+        self.running = Some(RunningState {
+            prefetch,
+            renderer,
+            egui_state,
+            gpu,
+            window,
+        });
 
         if let Some(path) = self.start_path.clone() {
             self.start_progressive_scan(path);
@@ -1197,26 +1239,22 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         // ── Main window events ───────────────────────────────────────────────
-        if let (Some(state), Some(window)) =
-            (self.egui_state.as_mut(), self.window.as_ref())
-        {
-            let _ = state.on_window_event(window, &event);
+        if let Some(s) = self.running.as_mut() {
+            let _ = s.egui_state.on_window_event(&s.window, &event);
         }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::Resized(size) => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.resize(size.width, size.height);
-                }
-                if let Some(w) = &self.window {
-                    if self.renderer.as_ref()
-                        .is_some_and(|r| r.display_mode == DisplayMode::Window && r.fit_to_image)
+                if let Some(s) = self.running.as_mut() {
+                    s.renderer.resize(size.width, size.height);
+                    if s.renderer.display_mode == DisplayMode::Window
+                        && s.renderer.fit_to_image
                     {
-                        clamp_to_screen(w);
+                        clamp_to_screen(&s.window);
                     }
-                    w.request_redraw();
+                    s.window.request_redraw();
                 }
 
                 // Track window size for fixed-size mode (saved on exit).
@@ -1243,7 +1281,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Any key dismisses help.  If the key is H (toggle), just
                 // close — don't propagate, or it immediately re-opens.
                 self.show_help = false;
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(s) = self.running() { s.window.request_redraw(); }
                 let is_h = matches!(logical_key, Key::Character(c) if c == "h" || c == "H");
                 if !is_h {
                     self.window_event(event_loop, window_id, event);
@@ -1265,7 +1303,7 @@ impl ApplicationHandler<AppEvent> for App {
                     self.delete_current();
                 } else if cancel {
                     self.pending_delete = false;
-                    if let Some(w) = &self.window { w.request_redraw(); }
+                    if let Some(s) = self.running() { s.window.request_redraw(); }
                 }
             }
 
@@ -1273,83 +1311,17 @@ impl ApplicationHandler<AppEvent> for App {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
-                // Snapshot before match — may go stale if an arm mutates the
-                // renderer (e.g. navigate → reset_zoom), but no arm reads these
-                // values after such a mutation.
-                let is_zoomed = self.renderer.as_ref().is_some_and(|r| r.viewport.is_zoomed());
-                let zoom      = self.renderer.as_ref().map_or(1.0, |r| r.viewport.zoom());
-                match logical_key {
-                Key::Named(NamedKey::ArrowRight) => {
-                    if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(-(PAN_STEP / zoom), 0.0); }
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    } else { self.navigate(1); }
+                let ctx = InputContext {
+                    is_zoomed: self.running()
+                        .is_some_and(|s| s.renderer.viewport.is_zoomed()),
+                    modifiers: self.modifiers,
+                    has_images: self.image_list.as_ref()
+                        .is_some_and(|l| !l.is_empty()),
+                };
+                if let Some(action) = input::resolve_key(&logical_key, ctx) {
+                    self.apply_action(action, event_loop);
                 }
-                Key::Named(NamedKey::ArrowDown) => {
-                    if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(0.0, PAN_STEP / zoom); }
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    } else { self.navigate(1); }
-                }
-                Key::Named(NamedKey::ArrowLeft) => {
-                    if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(PAN_STEP / zoom, 0.0); }
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    } else { self.navigate(-1); }
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.viewport.adjust_pan(0.0, -(PAN_STEP / zoom)); }
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    } else { self.navigate(-1); }
-                }
-                Key::Named(NamedKey::Space) => {
-                    if is_zoomed {
-                        if let Some(r) = self.renderer.as_mut() { r.viewport.reset_zoom(); }
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    } else if self.modifiers.shift_key() {
-                        self.navigate(-1);
-                    } else {
-                        self.navigate(1);
-                    }
-                }
-                Key::Named(NamedKey::Escape) => event_loop.exit(),
-                Key::Character(ref c) => match c.as_str() {
-                    "q" | "Q" => event_loop.exit(),
-                    "w" | "W" if self.modifiers.super_key() || self.modifiers.control_key() => {
-                        event_loop.exit();
-                    }
-                    "m" | "M" => self.toggle_mode(),
-                    "r" | "]" => self.rotate_image(true),
-                    "l" | "[" => self.rotate_image(false),
-                    "i"       => {
-                        self.show_info = !self.show_info;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    "d" | "D" if self.image_list.as_ref().is_some_and(|l| !l.is_empty()) => {
-                        self.pending_delete = true;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    "h" | "H" => {
-                        self.show_help = true;
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                    }
-                    "."       => self.navigate(1),
-                    // Ctrl/Cmd + , opens settings; plain , navigates
-                    ","       => {
-                        if self.modifiers.control_key() || self.modifiers.super_key() {
-                            self.open_settings(event_loop);
-                        } else {
-                            self.navigate(-1);
-                        }
-                    }
-                    "+" | "=" => self.zoom_in(),
-                    "-"        => self.zoom_out(),
-                    _ => {}
-                },
-                _ => {}
-                } // match logical_key
-            },
+            }
 
             // ── Mouse zoom ────────────────────────────────────────────────
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1359,20 +1331,22 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 if lines_y != 0.0 {
                     let factor = (1.0 + lines_y * SCROLL_SENSITIVITY) as f32;
-                    if let Some(r) = self.renderer.as_mut() {
-                        r.viewport.set_zoom(r.viewport.zoom() * factor);
+                    if let Some(s) = self.running.as_mut() {
+                        let z = s.renderer.viewport.zoom();
+                        s.renderer.viewport.set_zoom(z * factor);
+                        s.window.request_redraw();
                     }
-                    if let Some(w) = &self.window { w.request_redraw(); }
                 }
             }
 
             // macOS trackpad pinch-to-zoom
             WindowEvent::PinchGesture { delta, .. } if delta != 0.0 => {
                 let factor = (1.0 + delta) as f32;
-                if let Some(r) = self.renderer.as_mut() {
-                    r.viewport.set_zoom(r.viewport.zoom() * factor);
+                if let Some(s) = self.running.as_mut() {
+                    let z = s.renderer.viewport.zoom();
+                    s.renderer.viewport.set_zoom(z * factor);
+                    s.window.request_redraw();
                 }
-                if let Some(w) = &self.window { w.request_redraw(); }
             }
 
             // ── Mouse drag-to-pan ────────────────────────────────────────────
@@ -1388,14 +1362,12 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.drag_origin.is_some() {
                     let delta_x = position.x - self.last_cursor.x;
                     let delta_y = position.y - self.last_cursor.y;
-                    if let Some(w) = &self.window {
-                        let size = w.inner_size();
+                    if let Some(s) = self.running.as_mut() {
+                        let size = s.window.inner_size();
                         let pan_x = (delta_x / f64::from(size.width)  *  2.0) as f32;
                         let pan_y = (delta_y / f64::from(size.height) * -2.0) as f32;
-                        if let Some(r) = self.renderer.as_mut() {
-                            r.viewport.adjust_pan(pan_x, pan_y);
-                        }
-                        w.request_redraw();
+                        s.renderer.viewport.adjust_pan(pan_x, pan_y);
+                        s.window.request_redraw();
                     }
                 }
                 self.last_cursor = position;
@@ -1430,7 +1402,7 @@ impl ApplicationHandler<AppEvent> for App {
                             log::error!("directory scan failed: {e}");
                             if self.image_list.is_none() {
                                 self.status = AppStatus::FolderNotFound;
-                                if let Some(w) = &self.window { w.request_redraw(); }
+                                if let Some(s) = self.running() { s.window.request_redraw(); }
                             }
                         }
                     }
@@ -1450,21 +1422,21 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             AppEvent::DecodeReady => {
-                let mut current_path_ready: Option<PathBuf> = None;
-                if let Some(ref mut cache) = self.prefetch {
-                    let current_path = self.image_list.as_ref()
-                        .and_then(|l| l.current())
-                        .map(Path::to_path_buf);
+                let current_path = self.image_list.as_ref()
+                    .and_then(|l| l.current())
+                    .map(Path::to_path_buf);
 
-                    for path in cache.poll_into_cache() {
+                let mut current_path_ready: Option<PathBuf> = None;
+                if let Some(s) = self.running.as_mut() {
+                    for path in s.prefetch.poll_into_cache() {
                         if current_path.as_ref() == Some(&path) {
-                            cache.waiting_for_current = false;
+                            s.prefetch.waiting_for_current = false;
                             current_path_ready = Some(path);
                         }
                     }
                 }
                 if let Some(path) = current_path_ready {
-                    let entry = self.prefetch.as_mut().and_then(|c| c.get(&path));
+                    let entry = self.running.as_mut().and_then(|s| s.prefetch.get(&path));
                     if let Some(entry) = entry {
                         self.apply_cache_entry(path, entry);
                         self.trigger_prefetch();
@@ -1491,8 +1463,8 @@ impl ApplicationHandler<AppEvent> for App {
             .is_some_and(|t| t.elapsed().as_secs_f32() < MODE_DISPLAY_SECS);
 
         if needs_repaint {
-            if let Some(w) = &self.window {
-                w.request_redraw();
+            if let Some(s) = self.running() {
+                s.window.request_redraw();
             }
         }
     }
