@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — build artifacts but do NOT publish a GitHub Release"
+        type: boolean
+        default: true
+      version:
+        description: "Version string for package filenames (e.g. 0.3.2-rc1). Ignored on tag pushes."
+        type: string
+        default: "0.0.0-dryrun"
 
 permissions:
   contents: write
@@ -16,7 +26,9 @@ jobs:
     name: Linux x86_64 (.deb + .AppImage)
     runs-on: ubuntu-latest
     env:
-      PKG_VERSION: ${{ github.ref_name }}
+      # On tag push this is the tag (e.g. v0.3.2); on workflow_dispatch it's the
+      # user-supplied version input. The next step strips a leading "v" if any.
+      PKG_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +63,7 @@ jobs:
     name: macOS arm64 (.dmg)
     runs-on: macos-latest
     env:
-      PKG_VERSION: ${{ github.ref_name }}
+      PKG_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,6 +89,8 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build-linux, build-macos]
+    # Skip on dry-run dispatches; always run on tag pushes.
+    if: github.event_name == 'push' || inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
