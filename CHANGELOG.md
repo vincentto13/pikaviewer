@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.2] - 2026-04-22
+
+### Features
+
+- RAW format support — NEF/NRW (Nikon), CR2/CR3/CRW (Canon), ARW/SR2/SRF (Sony), RAF (Fujifilm), ORF (Olympus), RW2 (Panasonic), PEF (Pentax), DNG (Adobe) via vendored LibRaw (`--features iv-app/raw`, dual-licensed LGPL-2.1/CDDL-1.0; CDDL elected for static linking)
+- File associations for RAW formats on macOS (Info.plist) and Linux (.desktop + xdg-mime)
+- `THIRD_PARTY_NOTICES.md` bundled into every release artifact (.app, .deb, .AppImage, .dmg) documenting LibRaw, libheif, x265 licenses
+
+### Other
+
+- CI: macOS clippy job now builds with `iv-app/heic,iv-app/raw` to catch RAW breakage
+- Release workflow: new `workflow_dispatch` trigger with a `dry_run` flag — build artifacts without publishing a public Release
+- Linux release artifacts (.deb, .AppImage) now ship with RAW + HEIC enabled, matching the macOS DMG
+
 ## [0.3.1] - 2026-04-16
 
 ### Features
