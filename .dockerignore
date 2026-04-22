@@ -2,3 +2,4 @@ target/
 .git/
 .claude/
 *.md
+!THIRD_PARTY_NOTICES.md

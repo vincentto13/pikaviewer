@@ -8,6 +8,10 @@ members = [
     # iv-format-heic is intentionally excluded from workspace members so that
     # `cargo build` without --features iv-app/heic never requires libheif.
     # It is compiled only when pulled in as an optional dep of iv-app.
+    # iv-format-raw is excluded for the same reason — it pulls in rsraw-sys,
+    # which compiles a vendored LibRaw (LGPL-2.1/CDDL). The default build stays
+    # pure MIT; --features iv-app/raw opts into the LGPL-licensed combined
+    # distribution.
 ]
 
 [workspace.dependencies]
@@ -30,7 +34,7 @@ kamadak-exif = "0.5"
 notify      = "6"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 

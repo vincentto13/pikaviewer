@@ -13,10 +13,12 @@ workspace = true
 
 [features]
 heic = ["dep:iv-format-heic", "iv-format-heic/libheif-rs"]
+raw  = ["dep:iv-format-raw",  "iv-format-raw/rsraw"]
 
 [dependencies]
 iv-core     = { path = "../iv-core" }
 iv-format-heic = { path = "../iv-format-heic", optional = true }
+iv-format-raw  = { path = "../iv-format-raw",  optional = true }
 iv-formats  = { path = "../iv-formats" }
 iv-renderer = { path = "../iv-renderer" }
 winit       = { workspace = true }

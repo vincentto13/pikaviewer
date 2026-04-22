@@ -14,7 +14,7 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME="PikaViewer"
 BUNDLE_ID="xyz.astrolabius.pikaviewer"
-VERSION="0.3.1"
+VERSION="0.3.2"
 MIN_MACOS="12.0"
 BINARY_NAME="pikaviewer"
 TARGET="aarch64-apple-darwin"
@@ -41,14 +41,33 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-# ── HEIC prerequisite check ───────────────────────────────────────────────────
+# ── Feature detection ─────────────────────────────────────────────────────────
+FEATURES=()
+
 if pkg-config --atleast-version=1.18 libheif 2>/dev/null; then
     echo "==> libheif $(pkg-config --modversion libheif) found — HEIC/AVIF support enabled"
-    HEIC_FEATURE="--features iv-app/heic"
+    FEATURES+=("iv-app/heic")
 else
     echo "warning: libheif >= 1.18 not found — HEIC/AVIF support will be disabled"
     echo "         To enable: brew install libheif"
-    HEIC_FEATURE=""
+fi
+
+# RAW support: rsraw-sys vendors LibRaw C++ sources, so no system libraw is
+# needed. Xcode CLT ships clang + libclang for bindgen. Always enable on macOS.
+echo "==> RAW support enabled (vendored LibRaw via rsraw)"
+FEATURES+=("iv-app/raw")
+
+if [[ ${#FEATURES[@]} -gt 0 ]]; then
+    FEATURE_FLAG="--features $(IFS=,; echo "${FEATURES[*]}")"
+else
+    FEATURE_FLAG=""
+fi
+
+# Track HEIC separately for the dylib-bundling step below.
+if printf '%s\n' "${FEATURES[@]}" | grep -qx 'iv-app/heic'; then
+    HEIC_ENABLED=true
+else
+    HEIC_ENABLED=false
 fi
 
 echo "==> Building $APP_NAME $VERSION (target: $TARGET)"
@@ -56,8 +75,8 @@ cd "$REPO_ROOT"
 
 # ── Compile ───────────────────────────────────────────────────────────────────
 rustup target add "$TARGET" 2>/dev/null || true
-echo "==> cargo build --release --target $TARGET $HEIC_FEATURE"
-cargo build --release --target "$TARGET" $HEIC_FEATURE
+echo "==> cargo build --release --target $TARGET $FEATURE_FLAG"
+cargo build --release --target "$TARGET" $FEATURE_FLAG
 
 FINAL_BINARY="$BUILD_DIR/$TARGET/release/$BINARY_NAME"
 
@@ -78,6 +97,12 @@ if [[ ! -f "$ICNS" ]]; then
 fi
 cp "$ICNS" "$APP_BUNDLE/Contents/Resources/icon.icns"
 echo "    Copied icon.icns"
+
+# ── License + third-party notices ────────────────────────────────────────────
+cp "$REPO_ROOT/LICENSE" "$APP_BUNDLE/Contents/Resources/LICENSE"
+cp "$REPO_ROOT/THIRD_PARTY_NOTICES.md" \
+    "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
+echo "    Copied LICENSE + THIRD_PARTY_NOTICES.md"
 
 # ── Credits.html (from Credits.md) ───────────────────────────────────────────
 CREDITS_MD="$REPO_ROOT/assets/Credits.md"
@@ -103,7 +128,7 @@ fi
 # When HEIC is enabled the binary dynamically links against Homebrew's libheif
 # and its transitive deps.  We copy them into Frameworks/ and rewrite all load
 # paths to use @rpath so the .app is fully self-contained.
-if [[ -n "$HEIC_FEATURE" ]]; then
+if [[ "$HEIC_ENABLED" == true ]]; then
     echo "==> Bundling libheif dylibs"
     FRAMEWORKS="$APP_BUNDLE/Contents/Frameworks"
     mkdir -p "$FRAMEWORKS"
@@ -344,6 +369,119 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
             </array>
         </dict>
 
+        <!-- RAW formats (LibRaw) -->
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Nikon RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.nikon.raw-image</string>
+                <string>com.nikon.nrw-raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Canon RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.canon.cr2-raw-image</string>
+                <string>com.canon.cr3-raw-image</string>
+                <string>com.canon.crw-raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Sony RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.sony.arw-raw-image</string>
+                <string>com.sony.raw-image</string>
+                <string>com.sony.sr2-raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Fujifilm RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.fuji.raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Olympus RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.olympus.raw-image</string>
+                <string>com.olympus.or-raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Panasonic RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.panasonic.raw-image</string>
+                <string>com.panasonic.rw2-raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Pentax RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.pentax.raw-image</string>
+            </array>
+        </dict>
+
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Adobe DNG Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.adobe.raw-image</string>
+            </array>
+        </dict>
+
     </array>
 
     <!--
@@ -452,5 +590,14 @@ echo "  duti -s $BUNDLE_ID com.microsoft.ico all"
 echo "  duti -s $BUNDLE_ID public.heic all"
 echo "  duti -s $BUNDLE_ID public.heif all"
 echo "  duti -s $BUNDLE_ID public.avif all"
+echo "  duti -s $BUNDLE_ID com.nikon.raw-image all       # NEF"
+echo "  duti -s $BUNDLE_ID com.canon.cr2-raw-image all   # CR2"
+echo "  duti -s $BUNDLE_ID com.canon.cr3-raw-image all   # CR3"
+echo "  duti -s $BUNDLE_ID com.sony.arw-raw-image all    # ARW"
+echo "  duti -s $BUNDLE_ID com.fuji.raw-image all        # RAF"
+echo "  duti -s $BUNDLE_ID com.olympus.raw-image all     # ORF"
+echo "  duti -s $BUNDLE_ID com.panasonic.raw-image all   # RW2"
+echo "  duti -s $BUNDLE_ID com.pentax.raw-image all      # PEF"
+echo "  duti -s $BUNDLE_ID com.adobe.raw-image all       # DNG"
 echo ""
 echo "Or use Finder → Get Info → Open with → Change All for each type."

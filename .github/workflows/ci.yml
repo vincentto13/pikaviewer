@@ -44,5 +44,8 @@ jobs:
           brew install libheif
           echo "PKG_CONFIG_PATH=$(brew --prefix libheif)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
 
+      # macOS CI exercises both optional features because:
+      #  - libheif >= 1.18 is available via Homebrew (newer than Ubuntu's).
+      #  - rsraw-sys vendors LibRaw; Xcode CLT ships libclang for bindgen.
       - name: cargo clippy
-        run: cargo clippy --workspace --features iv-app/heic -- -D warnings
+        run: cargo clippy --workspace --features iv-app/heic,iv-app/raw -- -D warnings
