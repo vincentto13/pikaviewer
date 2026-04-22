@@ -60,7 +60,7 @@ fn decode_impl(data: &[u8]) -> Result<DecodedImage, FormatError> {
 
     let width = processed.width();
     let height = processed.height();
-    let rgb: &[u8] = &*processed;
+    let rgb: &[u8] = &processed;
 
     let expected = width as usize * height as usize * 3;
     if rgb.len() < expected {
