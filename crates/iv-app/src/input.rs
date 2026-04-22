@@ -87,28 +87,28 @@ fn has_cmd_or_ctrl(mods: ModifiersState) -> bool {
 pub const BINDINGS: &[Binding] = &[
     // ── Arrows (zoomed → pan) ────────────────────────────────────────────────
     Binding {
-        keys: &["\u{2192}"], sep: KeySep::Or,  // →
+        keys: &["Right"], sep: KeySep::Or,
         desc: "Pan left (when zoomed)",
         matches: |k, c| c.is_zoomed
             && matches!(k, Key::Named(NamedKey::ArrowRight)),
         action: Action::Pan(Dir::Left),
     },
     Binding {
-        keys: &["\u{2190}"], sep: KeySep::Or,  // ←
+        keys: &["Left"], sep: KeySep::Or,
         desc: "Pan right (when zoomed)",
         matches: |k, c| c.is_zoomed
             && matches!(k, Key::Named(NamedKey::ArrowLeft)),
         action: Action::Pan(Dir::Right),
     },
     Binding {
-        keys: &["\u{2193}"], sep: KeySep::Or,  // ↓
+        keys: &["Down"], sep: KeySep::Or,
         desc: "Pan up (when zoomed)",
         matches: |k, c| c.is_zoomed
             && matches!(k, Key::Named(NamedKey::ArrowDown)),
         action: Action::Pan(Dir::Up),
     },
     Binding {
-        keys: &["\u{2191}"], sep: KeySep::Or,  // ↑
+        keys: &["Up"], sep: KeySep::Or,
         desc: "Pan down (when zoomed)",
         matches: |k, c| c.is_zoomed
             && matches!(k, Key::Named(NamedKey::ArrowUp)),
@@ -117,14 +117,14 @@ pub const BINDINGS: &[Binding] = &[
 
     // ── Arrows (not zoomed → navigate) ───────────────────────────────────────
     Binding {
-        keys: &["\u{2192}", "\u{2193}"], sep: KeySep::Or,  // → / ↓
+        keys: &["Right", "Down"], sep: KeySep::Or,
         desc: "Next image",
         matches: |k, _| matches!(k,
             Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown)),
         action: Action::NavigateNext,
     },
     Binding {
-        keys: &["\u{2190}", "\u{2191}"], sep: KeySep::Or,  // ← / ↑
+        keys: &["Left", "Up"], sep: KeySep::Or,
         desc: "Previous image",
         matches: |k, _| matches!(k,
             Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp)),
