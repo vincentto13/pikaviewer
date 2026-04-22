@@ -98,6 +98,12 @@ fi
 cp "$ICNS" "$APP_BUNDLE/Contents/Resources/icon.icns"
 echo "    Copied icon.icns"
 
+# ── License + third-party notices ────────────────────────────────────────────
+cp "$REPO_ROOT/LICENSE" "$APP_BUNDLE/Contents/Resources/LICENSE"
+cp "$REPO_ROOT/THIRD_PARTY_NOTICES.md" \
+    "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
+echo "    Copied LICENSE + THIRD_PARTY_NOTICES.md"
+
 # ── Credits.html (from Credits.md) ───────────────────────────────────────────
 CREDITS_MD="$REPO_ROOT/assets/Credits.md"
 if [[ -f "$CREDITS_MD" ]]; then

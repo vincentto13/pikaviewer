@@ -23,11 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon-x11-dev \
     libudev-dev \
     libheif-dev \
+    clang \
+    libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --features iv-app/heic
+RUN cargo build --release --features iv-app/heic,iv-app/raw
 
 # ── Package stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS packager
@@ -53,6 +55,8 @@ WORKDIR /pkg
 # Bring in the binary and assets
 COPY --from=builder /build/target/release/pikaviewer /pkg/pikaviewer
 COPY --from=builder /build/assets/icon.png /pkg/icon.png
+COPY --from=builder /build/LICENSE /pkg/LICENSE
+COPY --from=builder /build/THIRD_PARTY_NOTICES.md /pkg/THIRD_PARTY_NOTICES.md
 
 # Version (can be overridden with --build-arg VERSION=x.y.z)
 ARG VERSION=0.1.0
@@ -62,6 +66,7 @@ ARG ARCH=amd64
 RUN mkdir -p /pkg/deb/DEBIAN \
              /pkg/deb/usr/bin \
              /pkg/deb/usr/share/applications \
+             /pkg/deb/usr/share/doc/pikaviewer \
              /pkg/deb/usr/share/icons/hicolor/256x256/apps \
              /pkg/deb/usr/share/icons/hicolor/512x512/apps \
              /pkg/deb/usr/share/icons/hicolor/1024x1024/apps
@@ -70,6 +75,10 @@ RUN cp /pkg/pikaviewer /pkg/deb/usr/bin/pikaviewer && \
     chmod 755 /pkg/deb/usr/bin/pikaviewer
 
 RUN cp /pkg/icon.png /pkg/deb/usr/share/icons/hicolor/1024x1024/apps/pikaviewer.png
+
+# License + third-party notices (standard Debian doc path)
+RUN cp /pkg/LICENSE /pkg/deb/usr/share/doc/pikaviewer/copyright && \
+    cp /pkg/THIRD_PARTY_NOTICES.md /pkg/deb/usr/share/doc/pikaviewer/THIRD_PARTY_NOTICES.md
 
 # .desktop file
 RUN printf '[Desktop Entry]\n\
@@ -80,7 +89,7 @@ Exec=pikaviewer %%f\n\
 Icon=pikaviewer\n\
 Terminal=false\n\
 Categories=Graphics;Viewer;\n\
-MimeType=image/jpeg;image/png;image/gif;image/bmp;image/tiff;image/webp;image/x-icon;image/vnd.microsoft.icon;image/heic;image/heif;image/avif;\n' \
+MimeType=image/jpeg;image/png;image/gif;image/bmp;image/tiff;image/webp;image/x-icon;image/vnd.microsoft.icon;image/heic;image/heif;image/avif;image/x-nikon-nef;image/x-nikon-nrw;image/x-canon-cr2;image/x-canon-cr3;image/x-canon-crw;image/x-sony-arw;image/x-sony-sr2;image/x-sony-srf;image/x-fuji-raf;image/x-olympus-orf;image/x-panasonic-rw2;image/x-pentax-pef;image/x-adobe-dng;\n' \
     > /pkg/deb/usr/share/applications/pikaviewer.desktop
 
 # Control file
@@ -97,7 +106,8 @@ Maintainer: astrolabius <dev@astrolabius.xyz>\n\
 Description: A fast, cross-platform image viewer\n\
  PikaViewer is a lightweight GPU-accelerated image viewer\n\
  built with Rust, wgpu, and egui. Supports JPEG, PNG, GIF,\n\
- BMP, TIFF, WebP, ICO, and optionally HEIC/HEIF/AVIF.\n' \
+ BMP, TIFF, WebP, ICO, HEIC/HEIF/AVIF, and RAW formats\n\
+ (NEF, CR2/CR3, ARW, RAF, ORF, RW2, PEF, DNG).\n' \
     "$VERSION" "$ARCH" "$INSTALLED_SIZE" \
     > /pkg/deb/DEBIAN/control
 
@@ -115,6 +125,13 @@ RUN cp /pkg/icon.png /pkg/AppDir/usr/share/icons/hicolor/256x256/apps/pikaviewer
     cp /pkg/icon.png /pkg/AppDir/pikaviewer.png
 
 RUN cp /pkg/deb/usr/share/applications/pikaviewer.desktop /pkg/AppDir/pikaviewer.desktop
+
+# License + third-party notices
+RUN mkdir -p /pkg/AppDir/usr/share/doc/pikaviewer && \
+    cp /pkg/LICENSE /pkg/AppDir/usr/share/doc/pikaviewer/LICENSE && \
+    cp /pkg/THIRD_PARTY_NOTICES.md /pkg/AppDir/usr/share/doc/pikaviewer/THIRD_PARTY_NOTICES.md && \
+    cp /pkg/LICENSE /pkg/AppDir/LICENSE && \
+    cp /pkg/THIRD_PARTY_NOTICES.md /pkg/AppDir/THIRD_PARTY_NOTICES.md
 
 # AppRun entry point
 RUN printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/pikaviewer" "$@"\n' \
